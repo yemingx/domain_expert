@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+venv2/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Node
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+
+# Data / uploads / generated output
+data/
+domain_pdf/
+backend/literature_research/result/
+
+# Env secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+/tmp/
+*.png
+test_*.cjs
+test_*.mjs
+inspect.cjs
+codex_wrapper.mjs

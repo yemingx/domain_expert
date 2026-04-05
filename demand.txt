@@ -1,0 +1,55 @@
+我想从头打造一个科研领域专家多agent智能体，我可以提供领域核心文献pdf，这个专家agent需要能够：
+1.剔除低引用，低分论文
+2.构建一个hypergraph，节点包括作者 时间 引用，提取科研合作网络/团体影响力/团体关系，时间，人，事，conflict
+3.从hypergraph筛选领域核心文献做精读和总结
+4.领域专家的共识和争议点，学科的边界、局限性以及当前的探索前沿
+5.交叉学科的分支学科自身的重大发展，用分支学科的进展预测学术新星/合作网络演化
+6.基于pdf构建非常精细的知识库，知识库要按照内容逻辑分层根据从pdf提取的分级meta data检索，RAG+大模型语义检测+OCR，避免细节内容识别错误，避免因为上下文限制造成信息丢失（像人一样去层层检索），检索的内容能溯源。
+7.通过构建文献引用关系图（节点特征包括文献时间和通讯作者，第一作者），提取领域发展的时间线对应的重大突破，不同技术路线优劣势的比较，以及领域中的核心争论点；
+8.能融合我的观点去写综述审稿修稿(human in the loop)；
+9.给一篇文章做审稿，给文章质量的各个方面打分，提出修稿意见；
+10.持续整合新的文献pdf到知识库和记忆里；
+11.在云服务器部署，host一个前端网页可以交互，能收发文件和对话，能在反馈的结果里提供溯源结果（论文引用的上标，点击能看到对应的原文）
+
+--- 2026-04-04 新增需求 ---
+
+12. Literature Research 文献调研模块需支持开放获取 PDF 全文自动下载：
+    - 根据已检索到的文献元数据（DOI、PMID），自动尝试下载开放获取 PDF 全文
+    - 下载策略（按优先级）：
+        a. Unpaywall API（最可靠，覆盖 gold/green OA 文献）
+        b. PubMed Central（PMC，通过 PMID → PMCID 获取）
+        c. Europe PMC PDF 直链
+        d. Semantic Scholar Open Access PDF API
+        e. 出版商直接下载（bioRxiv / medRxiv / Frontiers / PLOS / eLife / BMC / Nature OA / Springer OA）
+    - 下载的 PDF 路径写回到文献数据，可供后续 PDF 处理模块（OCR + 向量化）使用
+    - 已下载的文献自动跳过，避免重复下载
+    - 下载结果附加到 papers_complete.json 中（pdf_path / pdf_status / pdf_source 字段）
+
+13. 模块使用逻辑：
+    - 首先做 literature_research（PubMed 检索 + LLM 分析 + PDF 下载）
+    - 获得的 markdown/JSON 给到 hypergraph 和 timeline 模块做对应的解析和可视化
+    - 可视化优化：hypergraph 节点大小应表示人或文章的影响力
+      （影响力 = 论文数 × 期刊 IF + 共同作者数 + 通讯/第一作者次数 + 引用数）
+    - literature_research 结果导入知识库时按 topic（主题/领域）打标签
+    - 知识库按 topic 分区，建立对应领域的专家知识库
+
+14. 多领域专家知识库选择：
+    - 用户在 chat / review / writing 等模块中可以选择调用某个领域的专家知识库（按 topic 过滤）
+    - 也可以选择调用多个领域专家知识库的合集（topics 多选，OR 逻辑）
+    - 新增 API：
+        GET  /api/v1/knowledge/topics          — 列出所有可用专家知识库 topic
+        DELETE /api/v1/knowledge/topics/{topic} — 删除某个 topic 的所有 chunks
+        POST /api/v1/knowledge/query            — 支持 topic / topics 字段
+        POST /api/v1/knowledge/chat             — 支持 topic / topics 字段
+        POST /api/v1/writing/draft-review       — 支持 expert_topic / expert_topics 字段
+        POST /api/v1/writing/suggest-citations  — 支持 expert_topic / expert_topics 字段
+        POST /api/v1/review/evaluate            — 支持 expert_topic / expert_topics 字段
+
+15. 后端自动化测试（backend/tests/test_modules.py）：
+    - 覆盖 PDF 下载模块（mock 外部 HTTP 调用）
+    - 覆盖向量库 topic 标签过滤
+    - 覆盖 fetch_papers 文献检索解析
+    - 覆盖 literature_research_service 生命周期
+    - 覆盖报告生成（Markdown / HTML / HTML-PPT）
+    - 覆盖 hypergraph 构建逻辑
+    - 运行：cd backend && python tests/test_modules.py（34 tests，全部通过）

@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database - Internal only, not exposed to public
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: domain_expert
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Port only exposed to localhost for admin access, not public
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis for caching and task queue - Internal only
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    # Port only exposed to localhost for admin access, not public
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ChromaDB (Vector Store) - Internal only, accessed via Docker network
+  chromadb:
+    image: chromadb/chroma:latest
+    volumes:
+      - chroma_data:/chroma/chroma
+    # No public port exposure - only backend can access via Docker network
+    # If you need external access, uncomment below and bind to localhost only:
+    # ports:
+    #   - "127.0.0.1:8001:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+    restart: unless-stopped
+
+  # Backend API - Publicly accessible
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/domain_expert
+      - REDIS_URL=redis://redis:6379/0
+      - VECTOR_DB_PATH=/app/data/chromadb
+      - UPLOAD_DIR=/app/data/uploads
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - uploads_data:/app/data/uploads
+      - chroma_data:/app/data/chromadb
+    # Bind to all interfaces for public access
+    ports:
+      - "0.0.0.0:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    restart: unless-stopped
+
+  # Frontend - Publicly accessible on port 80
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    # Bind to all interfaces for public access
+    ports:
+      - "0.0.0.0:80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Celery Worker (for async processing)
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: celery -A app.tasks worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/domain_expert
+      - REDIS_URL=redis://redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - uploads_data:/app/data/uploads
+      - chroma_data:/app/data/chromadb
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  uploads_data:
