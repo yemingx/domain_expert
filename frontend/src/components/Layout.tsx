@@ -24,10 +24,10 @@ const { Sider, Content, Header } = AntLayout;
 const { Title } = Typography;
 
 const menuItems = [
+  { key: 'research', icon: <ExperimentOutlined />, label: 'Research' },
   { key: 'chat', icon: <MessageOutlined />, label: 'Chat' },
   { key: 'knowledge', icon: <SearchOutlined />, label: 'Knowledge' },
   { key: 'timeline', icon: <FieldTimeOutlined />, label: 'Timeline' },
-  { key: 'research', icon: <ExperimentOutlined />, label: 'Research' },
   { key: 'hypergraph', icon: <ShareAltOutlined />, label: 'Hypergraph' },
   { key: 'upload', icon: <UploadOutlined />, label: 'Upload' },
   { key: 'review', icon: <FileTextOutlined />, label: 'Review' },

@@ -65,6 +65,16 @@ export interface ResearchJob {
   completed_at?: string;
   error_message: string;
   result_path: string;  // local path to Markdown report
+  warnings: string[];   // partial failure messages (S2/LLM issues)
+  // Checkpoint/resume fields
+  stage_completed?: {
+    searching?: boolean;
+    enriching?: boolean;
+    analyzing?: boolean;
+    converting?: boolean;
+  };
+  last_successful_stage?: string;
+  stage_retry_count?: number;
 }
 
 export interface AuthorInfo {

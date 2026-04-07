@@ -335,104 +335,186 @@ def _extract_meta_from_markdown(md_text: str) -> dict:
 # ── PDF 转换 (Playwright / Puppeteer 备用) ────────────────────────────────────
 
 def _html_to_pdf_playwright(html_path: Path, pdf_path: Path) -> bool:
-    """使用 Playwright 逐幻灯片截图后合并为 PDF。
+    """逐张截图生成 PDF，再用 PyMuPDF 注入 DOI/PMID 可点击链接。
 
-    策略：逐张幻灯片滚动到可见区域后截图，避免 Chromium GPU 光栅化器
-    无法渲染页面 Y > ~16384px 以下内容导致截图空白的问题。
-    对超过 720px 的幻灯片（摘要过长）动态调整 viewport 高度。
+    策略：
+    1. 用 screen 模式（非 print 模式）测量每张幻灯片的真实高度，截取完整截图
+    2. 用 PyMuPDF 将截图拼成 PDF（每张一页，页面尺寸与截图匹配）
+    3. 从 Playwright 提取所有 <a href> 元素的位置，在 PyMuPDF 中注入 URI 注释
 
-    _DPR=2 → 物理像素 = CSS px × 2；_PDF_DPI=192 → PDF 尺寸 = CSS px。
+    优点：
+    - 摘要/分析内容完整显示（截图不截断内容）
+    - DOI / PubMed 链接保留为可点击的 PDF URI 注释
+    - 截图大小固定（JPEG 压缩），文件体积可控（~1–3 MB）
     """
-    _SLIDE_W, _SLIDE_H = 1280, 720
-    _DPR = 2
-    _PDF_DPI = 96 * _DPR  # 192
-
     try:
         from playwright.sync_api import sync_playwright
-        from PIL import Image as _PILImage
-        import io as _io
+        import fitz  # PyMuPDF
 
-        html_path = html_path.resolve()  # ensure absolute path for file:// URI
-        slide_imgs: list[_PILImage.Image] = []
+        html_path = html_path.resolve()
+
+        # 每英寸像素比（CSS px → PDF pt）：PDF pt = CSS px * 72 / 96
+        _PX_TO_PT = 72.0 / 96.0
+
         with sync_playwright() as p:
             browser = p.chromium.launch()
-            context = browser.new_context(
-                viewport={"width": _SLIDE_W, "height": _SLIDE_H},
-                device_scale_factor=_DPR,
-            )
-            page = context.new_page()
+            # 使用标准视口宽度；高度用于渲染但不影响截图范围
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
             page.goto(html_path.as_uri(), wait_until="networkidle")
             page.wait_for_timeout(500)
+
+            # 注入 CSS 修复：确保 overflow: visible + height: auto，内容不被截断
+            page.evaluate("""
+                () => {
+                    const fix = document.createElement('style');
+                    fix.id = '__pdf_overflow_fix__';
+                    fix.textContent = `
+                        .slide {
+                            overflow: visible !important;
+                            height: auto !important;
+                            min-height: 720px !important;
+                        }
+                        .slide-body {
+                            overflow: visible !important;
+                            height: auto !important;
+                        }
+                        .paper-info-grid {
+                            height: auto !important;
+                        }
+                        .abstract-panel {
+                            height: auto !important;
+                            overflow: visible !important;
+                        }
+                        .abstract-box-ppt {
+                            flex: 0 0 auto !important;
+                            overflow: visible !important;
+                        }
+                        .abstract-box-ppt .ab-text {
+                            overflow: visible !important;
+                            display: block !important;
+                            -webkit-line-clamp: unset !important;
+                            height: auto !important;
+                        }
+                        .dims-ppt-grid {
+                            height: auto !important;
+                        }
+                        .dim-ppt-body {
+                            overflow: visible !important;
+                        }
+                    `;
+                    document.head.appendChild(fix);
+                }
+            """)
+            page.wait_for_timeout(200)
 
             slides = page.query_selector_all(".slide")
             if not slides:
                 raise ValueError("HTML PPT 中未找到 .slide 元素")
 
-            cur_vp_h = _SLIDE_H  # 当前 viewport 高度（CSS px）
+            slide_count = len(slides)
+            logger.info("[PDF] 共 %d 张幻灯片，开始逐页截图", slide_count)
+
+            # 收集每张幻灯片的截图和链接信息
+            slide_images: list[bytes] = []
+            slide_heights: list[int] = []
+            # links_per_slide: list of list of {url, x, y, w, h} in CSS px (relative to slide)
+            links_per_slide: list[list[dict]] = []
 
             for idx, slide in enumerate(slides, 1):
-                # ── 1. 先滚动至可见（触发 GPU 渲染） ──────────────────────────
-                page.evaluate(
-                    "(el) => el.scrollIntoView({block:'start', behavior:'instant'})",
-                    slide,
-                )
-                page.wait_for_timeout(100)
+                # 先滚动到幻灯片（确保 bounding_box 坐标正确且可截图）
+                slide.scroll_into_view_if_needed()
+                page.wait_for_timeout(80)
 
-                # ── 2. 测量幻灯片高度（滚动后 bounding_box 为视口相对坐标） ──
                 box = slide.bounding_box()
                 if not box:
-                    logger.warning("Slide %d: bounding_box 为 None，跳过", idx)
-                    continue
-                actual_h = max(box["height"], _SLIDE_H)
+                    box = {"x": 0, "y": 0, "width": 1280, "height": 720}
+                actual_h = max(round(box["height"]), 720)
+                slide_heights.append(actual_h)
 
-                # ── 3. 若幻灯片高于当前 viewport，则扩展 viewport 并重新滚动 ──
-                if actual_h > cur_vp_h:
-                    cur_vp_h = int(actual_h) + 10
-                    page.set_viewport_size({"width": _SLIDE_W, "height": cur_vp_h})
-                    page.evaluate(
-                        "(el) => el.scrollIntoView({block:'start', behavior:'instant'})",
-                        slide,
-                    )
-                    page.wait_for_timeout(100)
-                    box = slide.bounding_box()
-                    if not box:
-                        logger.warning("Slide %d: resize 后 bounding_box 为 None，跳过", idx)
+                # 用 element.screenshot() — Playwright 自动处理滚动和裁剪
+                img_bytes = slide.screenshot(type="jpeg", quality=90)
+                slide_images.append(img_bytes)
+
+                # 收集此幻灯片内所有 <a href> 链接的位置（相对于幻灯片）
+                slide_links: list[dict] = []
+                anchors = slide.query_selector_all("a[href]")
+                for anchor in anchors:
+                    href = anchor.get_attribute("href") or ""
+                    if not href.startswith("http"):
                         continue
+                    ab = anchor.bounding_box()
+                    if not ab:
+                        continue
+                    # 转换为相对于幻灯片左上角的坐标
+                    slide_links.append({
+                        "url": href,
+                        "x": ab["x"] - box["x"],
+                        "y": ab["y"] - box["y"],
+                        "w": ab["width"],
+                        "h": ab["height"],
+                    })
+                links_per_slide.append(slide_links)
 
-                # ── 4. 截图（viewport 内截取，坐标均 < viewport 高度） ────────
-                img_bytes = page.screenshot(
-                    clip={
-                        "x": max(0.0, box["x"]),
-                        "y": max(0.0, box["y"]),
-                        "width": _SLIDE_W,
-                        "height": actual_h,
-                    },
-                    type="png",
-                )
-                img = _PILImage.open(_io.BytesIO(img_bytes)).convert("RGB")
-                slide_imgs.append(img)
-                logger.debug("Slide %d: %dx%d CSS px → 截图 %dx%d px",
-                             idx, _SLIDE_W, int(actual_h), img.width, img.height)
+                logger.debug("[PDF] Slide %d/%d: height=%dpx, links=%d",
+                             idx, slide_count, actual_h, len(slide_links))
 
             browser.close()
 
-        if not slide_imgs:
-            raise ValueError("未能截取任何幻灯片截图")
+        # ── 用 PyMuPDF 拼合 PDF ────────────────────────────────────────────────
+        merged = fitz.open()
 
-        # ── 合并为 PDF ───────────────────────────────────────────────────────
-        slide_imgs[0].save(
-            str(pdf_path),
-            format="PDF",
-            save_all=True,
-            append_images=slide_imgs[1:],
-            resolution=_PDF_DPI,
-        )
-        logger.info("PDF 已生成 (幻灯片 × %d 页, %d DPI): %s",
-                    len(slide_imgs), _PDF_DPI, pdf_path)
+        for idx, (img_bytes, actual_h, slide_links) in enumerate(
+            zip(slide_images, slide_heights, links_per_slide), 1
+        ):
+            # 页面尺寸（PDF pt）
+            page_w_pt = 1280 * _PX_TO_PT
+            page_h_pt = actual_h * _PX_TO_PT
+
+            pdf_page = merged.new_page(width=page_w_pt, height=page_h_pt)
+
+            # 插入 JPEG 截图
+            img_rect = fitz.Rect(0, 0, page_w_pt, page_h_pt)
+            pdf_page.insert_image(img_rect, stream=img_bytes)
+
+            # 注入链接注释
+            for lnk in slide_links:
+                lx = lnk["x"] * _PX_TO_PT
+                ly = lnk["y"] * _PX_TO_PT
+                lw = lnk["w"] * _PX_TO_PT
+                lh = lnk["h"] * _PX_TO_PT
+                link_rect = fitz.Rect(lx, ly, lx + lw, ly + lh)
+                pdf_page.insert_link({
+                    "kind": fitz.LINK_URI,
+                    "from": link_rect,
+                    "uri": lnk["url"],
+                })
+
+        # 保存（写到临时文件再原子重命名，避免 Windows 文件锁）
+        import tempfile as _tempfile
+        import shutil as _shutil
+        with _tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as _tf:
+            tmp_path = Path(_tf.name)
+        merged.save(str(tmp_path), garbage=4, deflate=True)
+        merged.close()
+
+        if pdf_path.exists():
+            for _attempt in range(8):
+                try:
+                    pdf_path.unlink()
+                    break
+                except PermissionError:
+                    import time as _time
+                    _time.sleep(0.5)
+        _shutil.move(str(tmp_path), str(pdf_path))
+
+        logger.info("[PDF] 截图 PDF 已生成（%d 页，内容完整）: %s", slide_count, pdf_path)
         return True
 
+    except ImportError as e:
+        logger.warning("PDF 生成依赖缺失 (%s)，请安装 playwright 和 pymupdf", e)
+        return False
     except Exception as e:
-        logger.warning("Playwright 转换失败: %s", e)
+        logger.warning("Playwright PDF 生成失败: %s", e)
         return False
 
 
@@ -469,7 +551,7 @@ def _validate_pdf_pages(pdf_path: Path) -> dict:
             mean = sum(samples) / len(samples)
             variance = sum((x - mean) ** 2 for x in samples) / len(samples)
             std_dev = variance ** 0.5
-            if std_dev < 8:  # 几乎纯色 → 空白页
+            if std_dev < 5:  # 几乎纯色 → 空白页（向量 PDF 渐变页 std_dev 一般 > 10）
                 blank_pages.append(page_num + 1)
                 logger.warning("[PDF空白页] 第 %d 页 std_dev=%.1f < 8，疑似空白",
                                page_num + 1, std_dev)

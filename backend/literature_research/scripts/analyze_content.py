@@ -4,6 +4,42 @@
 LLM 调用改为 Anthropic Python SDK，无需配置 API_KEY 或 BASE_URL。
 """
 import re
+import os
+import json
+from pathlib import Path
+
+
+def _load_model_from_settings() -> str:
+    """从 ~/.claude/settings.json 读取模型配置，如果没有则从环境读取。"""
+    # 优先级1: ~/.claude/settings.json
+    claude_settings_path = Path.home() / ".claude" / "settings.json"
+    if claude_settings_path.exists():
+        try:
+            with open(claude_settings_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                env_vars = data.get("env", {})
+                if "ANTHROPIC_MODEL" in env_vars:
+                    model = env_vars["ANTHROPIC_MODEL"]
+                    print(f"[analyze_content] 从 settings.json 加载模型: {model}")
+                    return model
+        except Exception as e:
+            print(f"[WARNING] 读取 settings.json 失败: {e}")
+
+    # 优先级2: 环境变量
+    env_model = os.environ.get("ANTHROPIC_MODEL")
+    if env_model:
+        print(f"[analyze_content] 从环境变量加载模型: {env_model}")
+        return env_model
+
+    # 默认模型
+    default_model = "claude-sonnet-4-20250514"
+    print(f"[analyze_content] 使用默认模型: {default_model}")
+    return default_model
+
+
+# Support ANTHROPIC_AUTH_TOKEN as fallback for ANTHROPIC_API_KEY
+if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+    os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
 
 try:
     import anthropic as _anthropic
@@ -14,26 +50,55 @@ except Exception as _e:
     _client = None
     _SDK_OK = False
 
-# 使用 Sonnet 进行深度分析（质量更高）
-_ANALYZE_MODEL = "claude-sonnet-4-6"
+# 加载模型配置
+_ANALYZE_MODEL = _load_model_from_settings()
+print(f"[analyze_content] 分析模型: {_ANALYZE_MODEL}")
+
+
+import time as _time
+
+_LLM_MAX_RETRIES = 3
+_LLM_RETRY_BACKOFF = (5, 10, 20)  # 秒
 
 
 def _call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
-    """调用 Anthropic SDK 进行分析。失败返回空字符串。"""
+    """调用 Anthropic SDK 进行分析，带指数退避重试（最多 3 次）。"""
     if not _SDK_OK or _client is None:
         print("[WARNING] SDK 不可用，跳过分析")
         return ""
-    try:
-        msg = _client.messages.create(
-            model=_ANALYZE_MODEL,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        return msg.content[0].text.strip()
-    except Exception as e:
-        print(f"[WARNING] LLM 分析调用失败: {e}")
-        return ""
+    last_err = ""
+    for attempt in range(_LLM_MAX_RETRIES):
+        try:
+            msg = _client.messages.create(
+                model=_ANALYZE_MODEL,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            # 处理不同类型的 content blocks (TextBlock, ThinkingBlock, etc.)
+            for block in msg.content:
+                if hasattr(block, 'text') and block.text:
+                    return block.text.strip()
+                elif hasattr(block, 'thinking') and block.thinking:
+                    # ThinkingBlock - 跳过，继续找 TextBlock
+                    continue
+            # 如果没有找到 text 属性，返回空字符串
+            print(f"[WARNING] LLM 响应中没有找到文本内容")
+            return ""
+        except Exception as e:
+            last_err = str(e)
+            err_lower = last_err.lower()
+            # 认证失败不重试
+            if "authentication" in err_lower or "invalid x-api-key" in err_lower:
+                print(f"[WARNING] LLM 认证失败，不重试: {e}")
+                return ""
+            if attempt == _LLM_MAX_RETRIES - 1:
+                break
+            wait = _LLM_RETRY_BACKOFF[attempt]
+            print(f"[WARNING] LLM 分析调用失败 ({attempt+1}/{_LLM_MAX_RETRIES})，{wait}s 后重试: {e}")
+            _time.sleep(wait)
+    print(f"[WARNING] LLM 分析调用最终失败（已重试 {_LLM_MAX_RETRIES} 次）: {last_err}")
+    return ""
 
 
 def extract_corresponding_author(article_xml):

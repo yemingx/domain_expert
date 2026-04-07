@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 # ── PubMed API ────────────────────────────────────────────────────────────────
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
+# ── 摘要质量检查配置 ───────────────────────────────────────────────────────────
+# 摘要最低字数要求（少于此字数视为不完整）
+MIN_ABSTRACT_WORDS = 50
+# 不完整句子指示词（以这些词结尾的摘要可能是被截断的）
+INCOMPLETE_SENTENCE_INDICATORS = [
+    "by", "is", "are", "was", "were", "been", "be", "being",
+    "to", "for", "of", "in", "on", "at", "with", "from",
+    "the", "a", "an", "and", "or",
+    "as", "due to", "because of", "such as",
+    "caused by", "mediated by", "associated with",
+    "characterized by", "defined as", "known as",
+    "通过", "由于", "基于", "作为",
+]
+
 # ── 默认配置 ──────────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
     "topic": "NIPD",
@@ -64,6 +78,94 @@ def _get_journal_if(journal_name: str, if_data: dict) -> str:
         if (kl in jll or jll in kl) and len(kl) > 5 and len(jll) > 5:
             return str(v)
     return "暂无数据"
+
+
+def _is_abstract_complete(abstract: str) -> tuple[bool, str]:
+    """检查摘要是否完整。
+
+    Returns:
+        (is_complete, reason): (是否完整, 不完整原因)
+    """
+    if not abstract or not abstract.strip():
+        return False, "摘要为空"
+
+    # 检查字数
+    words = abstract.split()
+    if len(words) < MIN_ABSTRACT_WORDS:
+        return False, f"摘要字数不足 ({len(words)} < {MIN_ABSTRACT_WORDS})"
+
+    # 检查是否以不完整指示词结尾
+    abstract_clean = abstract.strip().lower()
+    for indicator in INCOMPLETE_SENTENCE_INDICATORS:
+        if abstract_clean.endswith(indicator.lower()):
+            return False, f"摘要以不完整词结尾: '{indicator}'"
+
+    # 检查是否有成对的括号但未闭合
+    if abstract.count("(") != abstract.count(")"):
+        return False, "括号未闭合"
+    if abstract.count("[") != abstract.count("]"):
+        return False, "方括号未闭合"
+
+    # 检查是否以标点符号结尾（正常的句子应该如此）
+    if not abstract_clean[-1] in ".!?。！？":
+        return False, "摘要不以标点符号结尾"
+
+    return True, ""
+
+
+def _fetch_complete_abstract(article: ET.Element, doi: Optional[str]) -> tuple[str, list[str]]:
+    """获取完整的摘要，尝试多个来源。
+
+    Returns:
+        (abstract, sources_tried): (摘要文本, 尝试过的来源列表)
+    """
+    sources_tried = []
+
+    def _get_from_pubmed_xml() -> str:
+        """从 PubMed XML 中提取摘要。"""
+        abstract_text = ""
+        abstract_elem = article.find(".//Abstract")
+        if abstract_elem is not None:
+            sections = []
+            for te in abstract_elem.findall(".//AbstractText"):
+                label = te.get("Label", "")
+                content = te.text or ""
+                if content.strip():
+                    sections.append(f"{label}: {content}" if label else content)
+            abstract_text = "\n\n".join(sections)
+        return abstract_text
+
+    # 1. 首先尝试 PubMed XML
+    abstract = _get_from_pubmed_xml()
+    sources_tried.append("PubMed XML")
+
+    is_complete, reason = _is_abstract_complete(abstract)
+    if is_complete:
+        return abstract, sources_tried
+
+    logger.warning("PubMed XML 摘要不完整 (%s)，尝试回退来源", reason)
+
+    # 2. 尝试 Europe PMC
+    if doi:
+        abstract = _get_abstract_from_europepmc(doi)
+        if abstract:
+            sources_tried.append("Europe PMC")
+            is_complete, reason = _is_abstract_complete(abstract)
+            if is_complete:
+                return abstract, sources_tried
+            logger.warning("Europe PMC 摘要不完整 (%s)，继续尝试", reason)
+
+        # 3. 尝试浏览器抓取
+        abstract = _get_abstract_from_browser(doi)
+        if abstract:
+            sources_tried.append("Browser scrape")
+            is_complete, reason = _is_abstract_complete(abstract)
+            if is_complete:
+                return abstract, sources_tried
+            logger.warning("浏览器抓取摘要不完整 (%s)", reason)
+
+    # 如果所有来源都失败，返回 PubMed XML 的原始结果（即使不完整）
+    return _get_from_pubmed_xml(), sources_tried
 
 
 def _get_abstract_from_europepmc(doi: str) -> Optional[str]:
@@ -137,23 +239,10 @@ def _parse_article(article: ET.Element, if_data: dict) -> Optional[dict]:
     pmid_elem = article.find(".//PMID")
     pmid = pmid_elem.text if pmid_elem is not None else None
 
-    # 摘要（支持结构化多节）
-    abstract_text = ""
-    abstract_elem = article.find(".//Abstract")
-    if abstract_elem is not None:
-        sections = []
-        for te in abstract_elem.findall(".//AbstractText"):
-            label = te.get("Label", "")
-            content = te.text or ""
-            if content.strip():
-                sections.append(f"{label}: {content}" if label else content)
-        abstract_text = "\n\n".join(sections)
-
-    # 摘要回退：Europe PMC → 浏览器
-    if not abstract_text and doi:
-        abstract_text = (_get_abstract_from_europepmc(doi)
-                         or _get_abstract_from_browser(doi)
-                         or "")
+    # 摘要（尝试多个来源确保完整性）
+    abstract_text, sources_tried = _fetch_complete_abstract(article, doi)
+    if len(sources_tried) > 1:
+        logger.info("摘要获取: 尝试了 %d 个来源 %s", len(sources_tried), sources_tried)
 
     # 期刊
     journal_elem = article.find(".//Journal/Title")

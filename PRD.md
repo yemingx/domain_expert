@@ -1,7 +1,7 @@
 # Product Requirements Document
 ## Domain Expert — AI-Native Scientific Literature Intelligence Platform
 
-**Version:** 1.2  
+**Version:** 1.3  
 **Date:** 2026-04-05  
 **Status:** Active Development  
 
@@ -213,6 +213,31 @@ For each paper with a DOI or PMID, attempt download via the following priority c
 - Write `pdf_path`, `pdf_status`, `pdf_source` fields back to paper record
 - Rate-limit: configurable inter-request delay (default 1.5s)
 
+#### 6.1.4b Semantic Scholar Enrichment
+
+After PubMed fetch completes and before LLM analysis, each paper is enriched with data from the Semantic Scholar Academic Graph API. This runs as a new `enriching` stage in the job lifecycle.
+
+**Data fetched per paper:**
+
+| Field | Type | Description |
+|---|---|---|
+| `citation_count` | int | Total citation count on Semantic Scholar |
+| `influential_citation_count` | int | Count of papers that highly-cited this paper (S2 metric) |
+| `s2_paper_id` | str | Semantic Scholar internal paper ID |
+| `s2_url` | str | `https://www.semanticscholar.org/paper/{id}` |
+| `s2_authors` | list | Full author list from S2, including `authorId` for disambiguation |
+| `references` | list | Papers this paper cites (out-links): title, year, DOI, PMID, URL, citation_count, journal, authors |
+| `citations_in` | list | Papers that cite this paper (in-links): same structure as references |
+
+**Two-phase strategy:**
+
+- **Phase 1 (batch):** All papers queried in a single `POST /graph/v1/paper/batch` request (up to 500 per call), returning basic metrics (`citation_count`, `influential_citation_count`, `s2_authors`, etc.). Efficient for any corpus size.
+- **Phase 2 (per-paper):** For each paper with a matched S2 ID, fetches `/paper/{id}/references` and `/paper/{id}/citations` (up to 50 each). Only runs when corpus size ≤ `SEMANTIC_SCHOLAR_NETWORK_LIMIT` (default 100) to avoid excessive latency.
+
+**Rate limiting:** 1.1 req/s without API key; ~0.15 req/s (10/s) with `SEMANTIC_SCHOLAR_API_KEY`.
+
+**Graceful degradation:** Enrichment failures are non-fatal — the job continues to LLM analysis with whatever fields were successfully populated. Papers that cannot be matched on S2 retain default values (`citation_count=0`, `references=[]`, etc.).
+
 #### 6.1.5 Report Generation
 
 Upon job completion, automatically generate all four report formats:
@@ -259,7 +284,7 @@ pending → running → completed
   - API delete → result folder deleted from disk immediately
   - Manual result folder deletion → job disappears from the job list on next poll (stale job detection in `list_jobs()`)
 - Progress fields:
-  - `current_stage`: `searching` | `analyzing` | `converting` | `completed`
+  - `current_stage`: `searching` | `enriching` | `analyzing` | `converting` | `completed`
   - `processed_papers`: papers retrieved from PubMed (set to `total_papers` once search completes)
   - `analyzed_papers`: papers that have completed LLM deep analysis (incremented per-paper during `analyzing` stage)
   - `total_papers`: final paper count from PubMed
@@ -299,10 +324,34 @@ influence = (paper_count × journal_IF)
           + (coauthor_count × 0.5)
           + (first_author_count × 2)
           + (corresponding_author_count × 2)
-          + (citation_count × 0.1)
+          + (total_citations × 0.1)    // sum of citation_count across all author's papers (from S2)
 ```
 
-Node size is normalized relative to the maximum influence score in the current dataset.
+Node size is normalized relative to the maximum influence score in the current dataset. `total_citations` is populated from Semantic Scholar data when available; falls back to 0 if enrichment was skipped.
+
+#### Citation Network Edges
+
+When Semantic Scholar enrichment has been run, `_build_hypergraph_from_papers()` adds directed citation edges for within-corpus references:
+
+```
+citation_edges: [
+  { "type": "citation", "source": paper_id, "target": cited_paper_id, "weight": 1 },
+  ...
+]
+```
+
+Only edges where **both** source and target exist within the corpus are included. Cross-corpus citations are recorded in `paper.references` / `paper.citations_in` but not as hypergraph edges.
+
+`citation_stats` summary:
+```
+{
+  "total_citations":       int,    // sum of all citation_count values
+  "papers_with_citations": int,    // how many papers have citation_count > 0
+  "max_citations":         int,    // highest single-paper citation count
+  "in_corpus_links":       int,    // directed citation edges within the corpus
+  "most_cited":            list    // top-10 papers by citation_count
+}
+```
 
 #### Extracted Insights
 
@@ -664,6 +713,36 @@ generalization:         string
 pdf_path:               string | null
 pdf_status:             "success" | "not_available" | "failed" | "cached"
 pdf_source:             string
+
+// Semantic Scholar enrichment (populated during "enriching" stage)
+citation_count:               int       // S2 total citations
+influential_citation_count:   int       // S2 influential citations
+s2_paper_id:                  string    // Semantic Scholar internal ID
+s2_url:                       string    // https://www.semanticscholar.org/paper/{id}
+s2_authors:                   S2Author[]
+references:                   CitationStub[]   // papers this paper cites
+citations_in:                 CitationStub[]   // papers that cite this paper
+```
+
+### S2Author
+
+```
+name:      string
+authorId:  string    // Semantic Scholar author ID (for disambiguation)
+```
+
+### CitationStub
+
+```
+title:          string
+year:           int
+doi:            string | null
+pmid:           string | null
+s2_paper_id:    string | null
+url:            string | null    // Semantic Scholar URL
+citation_count: int
+journal:        string
+authors:        string[]         // first 3 author names
 ```
 
 ### Author

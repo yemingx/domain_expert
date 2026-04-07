@@ -10,7 +10,7 @@ import uuid
 import zipfile
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from typing import Optional
 import anthropic as _anthropic
@@ -99,6 +99,11 @@ class ResearchJobResponse(BaseModel):
     completed_at: Optional[str] = None
     error_message: str = ""
     result_path: str = ""  # Local path to Markdown report
+    warnings: list[str] = []  # Partial failure messages shown in frontend
+    # Checkpoint/resume fields
+    stage_completed: dict = {}  # Which stages are completed
+    last_successful_stage: str = ""  # Last stage that succeeded
+    stage_retry_count: int = 0  # How many times retried
 
 
 @router.post("/research/run", response_model=ResearchJobResponse)
@@ -153,6 +158,43 @@ async def delete_research_job(job_id: str):
     return {"job_id": job_id, "deleted": True}
 
 
+@router.post("/research/retry/{job_id}", response_model=ResearchJobResponse)
+async def retry_research_job(job_id: str):
+    """Retry a failed research job, resuming from the last successful stage.
+
+    This allows recovery from network instability or LLM API failures
+    without losing progress on completed stages.
+    """
+    service = get_research_service()
+    job = service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status == "running":
+        raise HTTPException(status_code=400, detail="Job is already running")
+
+    if job.status == "completed":
+        raise HTTPException(status_code=400, detail="Job is already completed")
+
+    # Retry the job - this will resume from the last successful stage
+    asyncio.create_task(service.retry_job(job_id))
+    return _job_to_response(job)
+
+
+@router.post("/research/reset/{job_id}", response_model=ResearchJobResponse)
+async def reset_research_job(job_id: str):
+    """Reset a research job to initial state, clearing all progress.
+
+    Use this when you want to start fresh rather than resume from checkpoint.
+    """
+    service = get_research_service()
+    try:
+        job = service.reset_job(job_id)
+        return _job_to_response(job)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/research/import/{job_id}")
 async def import_research_to_kb(job_id: str):
     """Import research results to knowledge base (tagged by topic)."""
@@ -183,7 +225,16 @@ async def delete_topic_kb(topic: str):
 
 @router.get("/research/download/{job_id}")
 async def download_research_report(job_id: str):
-    """Download a completed research job as a .zip archive."""
+    """Download all report files for a completed job as a single .zip archive.
+
+    Includes: raw MD (paper list), deep-analysis MD, Word, HTML reading version,
+    HTML PPT, PDF PPT.  If a pre-built ZIP exists on disk it is served directly
+    (fast path).  Otherwise all converted files are generated on demand and
+    packaged into a ZIP that is streamed back to the client.
+    """
+    import sys
+    from pathlib import Path
+
     service = get_research_service()
     job = service.get_job(job_id)
     if not job:
@@ -191,84 +242,109 @@ async def download_research_report(job_id: str):
     if job.status != "completed":
         raise HTTPException(status_code=400, detail="Job not completed yet")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # 1. CSV of papers
-        csv_buf = io.StringIO()
-        writer = csv.writer(csv_buf)
-        writer.writerow([
-            "PMID", "DOI", "Title", "Authors", "Journal",
-            "Impact Factor", "Year", "Abstract",
-        ])
-        for p in job.papers:
-            authors_str = "; ".join(
-                a.get("name", "") for a in p.get("authors_meta", p.get("authors", []))
-            )
-            writer.writerow([
-                p.get("pmid", ""), p.get("doi", ""),
-                p.get("title", ""), authors_str,
-                p.get("journal", ""), p.get("journal_if", ""),
-                p.get("year", ""), p.get("abstract", ""),
-            ])
-        zf.writestr("papers.csv", csv_buf.getvalue())
+    # ── Fast path: serve pre-built ZIP directly ────────────────────────────
+    zip_path = getattr(job, "zip_path", "")
+    if zip_path and Path(zip_path).exists():
+        zip_name = Path(zip_path).name
+        return FileResponse(
+            str(Path(zip_path)),
+            media_type="application/zip",
+            headers={"Content-Disposition": _content_disposition(zip_name)},
+        )
 
-        # 2. Markdown summary report
-        yr = job.year_range or {}
-        md_lines = [
-            f"# Literature Research Report: {job.topic}",
-            "",
-            f"**Query**: `{job.query}`",
-            f"**Max Papers Requested**: {job.max_papers}",
-            f"**Total Papers Found**: {job.total_papers}",
-            f"**Year Range**: {yr.get('min', 'N/A')} - {yr.get('max', 'N/A')}",
-            f"**Unique Institutions**: {job.unique_institutions}",
-            f"**Created**: {job.created_at}",
-            f"**Completed**: {job.completed_at}",
-            "", "---", "", "## Paper List", "",
-        ]
-        for i, p in enumerate(job.papers, 1):
-            md_lines.append(f"### {i}. {p.get('title', 'No title')}")
-            md_lines.append("")
-            display = p.get("author_display") or p.get("first_author", "Unknown")
-            md_lines.append(f"- **Authors**: {display}")
-            md_lines.append(
-                f"- **Journal**: {p.get('journal', '')} "
-                f"(IF: {p.get('journal_if', 'N/A')})"
-            )
-            md_lines.append(f"- **Year**: {p.get('year', '')}")
-            if p.get("pmid"):
-                md_lines.append(f"- **PMID**: {p['pmid']}")
-            if p.get("doi"):
-                md_lines.append(f"- **DOI**: {p['doi']}")
-            abstract = p.get("abstract", "")
-            if abstract and abstract != "No abstract":
-                md_lines.append(f"- **Abstract**: {abstract}")
-            md_lines.append("")
-        zf.writestr("report.md", "\n".join(md_lines))
+    # ── Build raw MD content (always available, no disk file) ──────────────────
+    yr = job.year_range or {}
+    md_lines = [
+        f"# 文献调研报告：{job.topic}",
+        "",
+        f"**查询**：`{job.query}`",
+        f"**最大文献数**：{job.max_papers}",
+        f"**实际获取**：{job.total_papers}",
+        f"**年份范围**：{yr.get('min', 'N/A')} – {yr.get('max', 'N/A')}",
+        f"**创建时间**：{job.created_at}",
+        f"**完成时间**：{job.completed_at}",
+        "", "---", "", "## 文献列表", "",
+    ]
+    for i, p in enumerate(job.papers, 1):
+        md_lines.append(f"### {i}. {p.get('title', '无标题')}")
+        md_lines.append("")
+        display = p.get("author_display") or p.get("first_author", "Unknown")
+        md_lines.append(f"- **作者**: {display}")
+        md_lines.append(
+            f"- **期刊**: {p.get('journal', '')} (IF: {p.get('journal_if', 'N/A')})"
+        )
+        md_lines.append(f"- **年份**: {p.get('year', '')}")
+        if p.get("pmid"):
+            md_lines.append(f"- **PMID**: {p['pmid']}")
+        if p.get("doi"):
+            md_lines.append(f"- **DOI**: {p['doi']}")
+        abstract = p.get("abstract", "")
+        if abstract and abstract not in ("No abstract", ""):
+            md_lines.append(f"- **摘要**: {abstract}")
+        md_lines.append("")
+    raw_md_bytes = "\n".join(md_lines).encode("utf-8")
+    raw_md_name = f"{job.topic}_{job_id[:8]}_raw.md"
 
-        # 3. Raw JSON data
-        raw = {
-            "job_id": job.job_id,
-            "topic": job.topic,
-            "query": job.query,
-            "max_papers": job.max_papers,
-            "total_papers": job.total_papers,
-            "year_range": job.year_range,
-            "unique_institutions": job.unique_institutions,
-            "created_at": job.created_at,
-            "completed_at": job.completed_at,
-            "papers": job.papers,
+    # ── Collect disk files, generate any missing converted formats ─────────────
+    disk_files: list[tuple[Path, str]] = []  # (abs_path, arcname)
+    result_path = getattr(job, "result_path", "")
+    if result_path and Path(result_path).exists():
+        md_path = Path(result_path)
+        output_dir = md_path.parent
+        stem = md_path.stem
+        disk_files.append((md_path, md_path.name))
+
+        target_map = {
+            "word":     output_dir / f"{stem}.docx",
+            "html":     output_dir / f"{stem}_阅读版.html",
+            "html_ppt": output_dir / f"{stem}_ppt.html",
+            "pdf_ppt":  output_dir / f"{stem}_ppt.pdf",
         }
-        zf.writestr("raw_data.json", json.dumps(raw, ensure_ascii=False, indent=2))
+        missing = [fmt for fmt, fp in target_map.items() if not fp.exists()]
+        if missing:
+            scripts_dir = (
+                Path(__file__).parent.parent.parent / "literature_research" / "scripts"
+            )
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            try:
+                from md_to_reports import convert_markdown_to_reports
+                await asyncio.to_thread(
+                    convert_markdown_to_reports,
+                    md_path=md_path, output_dir=output_dir, formats=missing,
+                )
+            except Exception as e:
+                logger.error("Format conversion failed for job %s: %s", job_id, e)
 
-    buf.seek(0)
-    filename = f"research_{job.topic}_{job.job_id[:8]}.zip"
+        for fp in target_map.values():
+            if fp.exists():
+                disk_files.append((fp, fp.name))
+
+    # ── Build ZIP in a thread (I/O-heavy; ZIP_STORED avoids CPU compression) ────
+    def _build_zip() -> io.BytesIO:
+        b = io.BytesIO()
+        with zipfile.ZipFile(b, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr(raw_md_name, raw_md_bytes)
+            for abs_path, arcname in disk_files:
+                zf.write(str(abs_path), arcname)
+        b.seek(0)
+        return b
+
+    buf = await asyncio.to_thread(_build_zip)
+
+    async def _iter_chunks(b: io.BytesIO, chunk_size: int = 512 * 1024):
+        while True:
+            data = b.read(chunk_size)
+            if not data:
+                break
+            yield data
+
+    zip_name = f"{job.topic}_{job_id[:8]}_reports.zip"
     return StreamingResponse(
-        buf,
+        _iter_chunks(buf),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _content_disposition(zip_name)},
     )
-
 
 class ConvertRequest(BaseModel):
     formats: list[str] = ["word", "html", "html_ppt", "pdf_ppt"]
@@ -342,6 +418,145 @@ async def convert_research_report(job_id: str, request: ConvertRequest = None):
     )
 
 
+_FORMAT_MEDIA_TYPES = {
+    "raw_md": "text/markdown",
+    "report_md": "text/markdown",
+    "word": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "html": "text/html; charset=utf-8",
+    "html_ppt": "text/html; charset=utf-8",
+    "pdf_ppt": "application/pdf",
+}
+
+
+def _content_disposition(filename: str) -> str:
+    """Return a Content-Disposition header value that handles non-ASCII filenames."""
+    from urllib.parse import quote
+    ascii_name = filename.encode("ascii", errors="replace").decode("ascii")
+    encoded = quote(filename, encoding="utf-8")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+@router.get("/research/file/{job_id}/{file_format}")
+async def download_research_file(job_id: str, file_format: str):
+    """Download a single format file for a completed research job.
+
+    file_format: raw_md | report_md | word | html | html_ppt | pdf_ppt
+    - raw_md     : simple paper-list Markdown (generated from job data inline)
+    - report_md  : deep-analysis Markdown at result_path
+    - word       : .docx converted from report_md
+    - html       : HTML reading version
+    - html_ppt   : HTML PPT version
+    - pdf_ppt    : PDF PPT version (may take a while to generate)
+    """
+    import sys
+    from pathlib import Path
+
+    if file_format not in _FORMAT_MEDIA_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown format: {file_format}")
+
+    service = get_research_service()
+    job = service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail="Job not completed yet")
+
+    # ── raw_md: paper-list summary (always available) ──────────────────────────
+    if file_format == "raw_md":
+        yr = job.year_range or {}
+        md_lines = [
+            f"# 文献调研报告：{job.topic}",
+            "",
+            f"**查询**：`{job.query}`",
+            f"**最大文献数**：{job.max_papers}",
+            f"**实际获取**：{job.total_papers}",
+            f"**年份范围**：{yr.get('min', 'N/A')} – {yr.get('max', 'N/A')}",
+            f"**创建时间**：{job.created_at}",
+            f"**完成时间**：{job.completed_at}",
+            "", "---", "", "## 文献列表", "",
+        ]
+        for i, p in enumerate(job.papers, 1):
+            md_lines.append(f"### {i}. {p.get('title', '无标题')}")
+            md_lines.append("")
+            display = p.get("author_display") or p.get("first_author", "Unknown")
+            md_lines.append(f"- **作者**: {display}")
+            md_lines.append(
+                f"- **期刊**: {p.get('journal', '')} (IF: {p.get('journal_if', 'N/A')})"
+            )
+            md_lines.append(f"- **年份**: {p.get('year', '')}")
+            if p.get("pmid"):
+                md_lines.append(f"- **PMID**: {p['pmid']}")
+            if p.get("doi"):
+                md_lines.append(f"- **DOI**: {p['doi']}")
+            abstract = p.get("abstract", "")
+            if abstract and abstract not in ("No abstract", ""):
+                md_lines.append(f"- **摘要**: {abstract}")
+            md_lines.append("")
+        content = "\n".join(md_lines).encode("utf-8")
+        fname = f"{job.topic}_{job_id[:8]}_raw.md"
+        return StreamingResponse(
+            io.BytesIO(content),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": _content_disposition(fname)},
+        )
+
+    # ── All other formats need result_path ──────────────────────────────────────
+    result_path = getattr(job, "result_path", "")
+    if not result_path or not Path(result_path).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="深度分析报告文件不存在，请重新运行任务以重新生成"
+        )
+
+    # ── report_md: serve deep-analysis markdown directly ───────────────────────
+    if file_format == "report_md":
+        p = Path(result_path)
+        return FileResponse(
+            str(p),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": _content_disposition(p.name)},
+        )
+
+    # ── Converted formats: check cache, generate if needed ─────────────────────
+    md_path = Path(result_path)
+    output_dir = md_path.parent
+    stem = md_path.stem
+    target_map = {
+        "word":     output_dir / f"{stem}.docx",
+        "html":     output_dir / f"{stem}_阅读版.html",
+        "html_ppt": output_dir / f"{stem}_ppt.html",
+        "pdf_ppt":  output_dir / f"{stem}_ppt.pdf",
+    }
+    target = target_map[file_format]
+
+    if not target.exists():
+        scripts_dir = Path(__file__).parent.parent.parent / "literature_research" / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        try:
+            from md_to_reports import convert_markdown_to_reports
+            # pdf_ppt requires html_ppt to exist first
+            gen_formats = (
+                [file_format] if file_format != "pdf_ppt"
+                else (["html_ppt", "pdf_ppt"] if not target_map["html_ppt"].exists() else ["pdf_ppt"])
+            )
+            convert_markdown_to_reports(
+                md_path=md_path, output_dir=output_dir, formats=gen_formats
+            )
+        except Exception as e:
+            logger.error("File generation failed for job %s format %s: %s", job_id, file_format, e)
+            raise HTTPException(status_code=500, detail=f"文件生成失败: {e}")
+
+        if not target.exists():
+            raise HTTPException(status_code=500, detail=f"文件生成失败（输出文件未找到）: {file_format}")
+
+    return FileResponse(
+        str(target),
+        media_type=_FORMAT_MEDIA_TYPES[file_format],
+        headers={"Content-Disposition": _content_disposition(target.name)},
+    )
+
+
 @router.get("/research/completed")
 async def get_completed_research():
     """Get list of completed research jobs for timeline analysis selection."""
@@ -373,6 +588,11 @@ def _job_to_response(job: ResearchJob) -> ResearchJobResponse:
         completed_at=job.completed_at,
         error_message=job.error_message,
         result_path=getattr(job, "result_path", ""),
+        warnings=getattr(job, "warnings", None) or [],
+        # Checkpoint fields
+        stage_completed=getattr(job, "stage_completed", {}),
+        last_successful_stage=getattr(job, "last_successful_stage", ""),
+        stage_retry_count=getattr(job, "stage_retry_count", 0),
     )
 
 
@@ -858,6 +1078,10 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
 
     Nodes: authors, papers, time periods, institutions, concepts
     Hyperedges: co-authorship, citation, temporal proximity, institutional affiliation
+
+    If papers have been enriched with Semantic Scholar data, citation edges are
+    added for within-corpus references and paper nodes include citation_count,
+    influential_citation_count, s2_url.
     """
     nodes = {
         "authors": {},
@@ -867,6 +1091,16 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
         "concepts": {},
     }
     hyperedges = []
+
+    # Build a lookup set for fast within-corpus detection: doi and pmid → paper_id
+    corpus_doi_map: dict[str, str] = {}   # doi → paper_id
+    corpus_pmid_map: dict[str, str] = {}  # pmid → paper_id
+    for paper in papers:
+        pid = paper.get("pmid") or paper.get("doi") or paper.get("title", "")[:50]
+        if paper.get("doi"):
+            corpus_doi_map[paper["doi"].lower().strip()] = pid
+        if paper.get("pmid"):
+            corpus_pmid_map[str(paper["pmid"]).strip()] = pid
 
     # Build author and paper nodes
     for paper in papers:
@@ -878,7 +1112,13 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
             "year": paper.get("year", 0),
             "month": paper.get("month", 0),
             "journal": paper.get("journal", ""),
+            "journal_if": paper.get("journal_if", ""),
             "citation_count": paper.get("citation_count", 0),
+            "influential_citation_count": paper.get("influential_citation_count", 0),
+            "s2_paper_id": paper.get("s2_paper_id", ""),
+            "s2_url": paper.get("s2_url", ""),
+            "doi": paper.get("doi", ""),
+            "pmid": paper.get("pmid", ""),
         }
 
         # Time period node (by year)
@@ -909,9 +1149,11 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
                     "is_corresponding_author_count": 0,
                     "papers": [],
                     "coauthors": set(),
+                    "total_citations": 0,  # sum of citation_count of their papers
                 }
 
             nodes["authors"][author_id]["papers"].append(paper_id)
+            nodes["authors"][author_id]["total_citations"] += paper.get("citation_count", 0)
             if author.get("is_first_author"):
                 nodes["authors"][author_id]["is_first_author_count"] += 1
             if author.get("is_corresponding_author"):
@@ -964,6 +1206,49 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
                 "weight": 1,
             })
 
+    # ── Citation network: directed edges within the corpus ───────────────────
+    citation_edges: list[dict] = []
+    in_corpus_link_count = 0
+
+    for paper in papers:
+        paper_id = paper.get("pmid") or paper.get("doi") or paper.get("title", "")[:50]
+        for ref in paper.get("references", []):
+            ref_doi = (ref.get("doi") or "").lower().strip()
+            ref_pmid = str(ref.get("pmid") or "").strip()
+            target_id = (
+                corpus_doi_map.get(ref_doi)
+                or corpus_pmid_map.get(ref_pmid)
+            )
+            if target_id and target_id != paper_id:
+                citation_edges.append({
+                    "type": "citation",
+                    "source": paper_id,
+                    "target": target_id,
+                    "weight": 1,
+                })
+                in_corpus_link_count += 1
+
+    # ── Citation statistics ───────────────────────────────────────────────────
+    all_citation_counts = [
+        n["citation_count"] for n in nodes["papers"].values()
+        if n["citation_count"] > 0
+    ]
+    citation_stats = {
+        "total_citations": sum(all_citation_counts),
+        "papers_with_citations": len(all_citation_counts),
+        "max_citations": max(all_citation_counts) if all_citation_counts else 0,
+        "in_corpus_links": in_corpus_link_count,
+        "most_cited": sorted(
+            [
+                {"paper_id": n["id"], "title": n["title"][:60],
+                 "year": n["year"], "citation_count": n["citation_count"]}
+                for n in nodes["papers"].values() if n["citation_count"] > 0
+            ],
+            key=lambda x: x["citation_count"],
+            reverse=True,
+        )[:10],
+    }
+
     # Convert sets to lists for JSON serialization
     for author in nodes["authors"].values():
         author["coauthors"] = list(author["coauthors"])
@@ -974,6 +1259,8 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
     return {
         "nodes": {k: list(v.values()) if isinstance(v, dict) else v for k, v in nodes.items()},
         "hyperedges": hyperedges,
+        "citation_edges": citation_edges,
+        "citation_stats": citation_stats,
     }
 
 
@@ -993,10 +1280,19 @@ def _build_hypergraph_analysis_prompt(
         "total_hyperedges": len(hypergraph["hyperedges"]),
     }
 
-    # Get top collaborators
+    citation_stats = hypergraph.get("citation_stats", {})
+
+    # Top collaborators by coauthor count
     authors_by_coauthor_count = sorted(
         hypergraph["nodes"]["authors"],
         key=lambda a: len(a.get("coauthors", [])),
+        reverse=True,
+    )[:10]
+
+    # Top authors by total citation count of their papers
+    authors_by_citations = sorted(
+        hypergraph["nodes"]["authors"],
+        key=lambda a: a.get("total_citations", 0),
         reverse=True,
     )[:10]
 
@@ -1014,6 +1310,8 @@ def _build_hypergraph_analysis_prompt(
 - Total Papers: {stats['total_papers']}
 - Total Institutions: {stats['total_institutions']}
 - Total Relationships: {stats['total_hyperedges']}
+- Total Citations (S2): {citation_stats.get('total_citations', 'N/A')}
+- Within-corpus Citation Links: {citation_stats.get('in_corpus_links', 0)}
 
 ## Top Collaborators (by number of coauthors)
 """
@@ -1024,6 +1322,20 @@ def _build_hypergraph_analysis_prompt(
         if author.get('is_corresponding_author_count', 0) > 0:
             prompt += f", corresponding author on {author['is_corresponding_author_count']} papers"
         prompt += "\n"
+
+    if citation_stats.get("total_citations", 0) > 0:
+        prompt += "\n## Most Cited Papers in Corpus\n"
+        for item in citation_stats.get("most_cited", [])[:8]:
+            prompt += f"- [{item['year']}] {item['title']} — {item['citation_count']} citations\n"
+
+        prompt += "\n## Top Authors by Total Citations\n"
+        for author in authors_by_citations:
+            tc = author.get("total_citations", 0)
+            if tc > 0:
+                prompt += (
+                    f"- {author['name']}: {tc} total citations across "
+                    f"{len(author.get('papers', []))} papers\n"
+                )
 
     prompt += f"\n## Papers by Year\n"
     for year in sorted(papers_by_year.keys()):

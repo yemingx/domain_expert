@@ -36,6 +36,6 @@ export const useAppStore = create<AppState>((set) => ({
 
   sidebarCollapsed: false,
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
-  activeTab: 'chat',
+  activeTab: 'research',
   setActiveTab: (tab) => set({ activeTab: tab }),
 }));

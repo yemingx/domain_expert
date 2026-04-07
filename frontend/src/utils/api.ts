@@ -60,6 +60,16 @@ export async function getResearchJob(jobId: string): Promise<ResearchJob> {
   return data;
 }
 
+export async function retryResearchJob(jobId: string): Promise<ResearchJob> {
+  const { data } = await api.post(`/research/retry/${jobId}`);
+  return data;
+}
+
+export async function resetResearchJob(jobId: string): Promise<ResearchJob> {
+  const { data } = await api.post(`/research/reset/${jobId}`);
+  return data;
+}
+
 export async function importResearchToKB(jobId: string): Promise<{ job_id: string; chunks_added: number }> {
   const { data } = await api.post(`/research/import/${jobId}`);
   return data;
@@ -72,22 +82,6 @@ export async function deleteResearchJob(jobId: string): Promise<{ job_id: string
 
 export function getResearchDownloadUrl(jobId: string): string {
   return `/api/v1/research/download/${jobId}`;
-}
-
-export function getResearchConvertUrl(jobId: string): string {
-  return `/api/v1/research/convert/${jobId}`;
-}
-
-export async function convertResearchReport(
-  jobId: string,
-  formats: string[] = ['word', 'html', 'html_ppt', 'pdf_ppt'],
-): Promise<Blob> {
-  const response = await api.post(
-    `/research/convert/${jobId}`,
-    { formats },
-    { responseType: 'blob' },
-  );
-  return response.data;
 }
 
 export async function getCompletedResearch(): Promise<CompletedResearch[]> {

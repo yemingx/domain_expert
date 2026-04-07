@@ -34,21 +34,42 @@ class ResearchJob:
     total_papers: int = 0
     processed_papers: int = 0
     analyzed_papers: int = 0
-    current_stage: str = ""  # searching, analyzing, converting
+    current_stage: str = ""  # searching, enriching, analyzing, converting
 
     # Results
     papers: list[dict] = field(default_factory=list)
     error_message: str = ""
     result_path: str = ""  # Local path to Markdown report
 
+    # Warnings / partial failures (shown in frontend)
+    warnings: list[str] = field(default_factory=list)
+
     # Metadata
     year_range: dict = field(default_factory=dict)
     unique_institutions: int = 0
+
+    # Pre-built ZIP path (populated after job completes)
+    zip_path: str = ""
 
     # Timestamps
     created_at: str = ""
     started_at: str = ""
     completed_at: str = ""
+
+    # ===== Checkpoint / Resume Support =====
+    # Stage-level checkpoints for resume capability
+    stage_completed: dict = field(default_factory=lambda: {
+        "searching": False,
+        "enriching": False,
+        "analyzing": False,
+        "converting": False,
+    })
+    # Per-paper processing status: {pmid: {"translated": bool, "analyzed": bool, "attempts": int}}
+    paper_status: dict = field(default_factory=dict)
+    # Last successful stage for resume
+    last_successful_stage: str = ""
+    # Retry counter for the current stage
+    stage_retry_count: int = 0
 
 
 class LiteratureResearchService:
@@ -114,7 +135,7 @@ class LiteratureResearchService:
         return job
 
     async def run_job(self, job_id: str) -> ResearchJob:
-        """Execute a research job using the local research module."""
+        """Execute a research job using the local research module with checkpoint/resume support."""
         job = self.jobs.get(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
@@ -123,8 +144,7 @@ class LiteratureResearchService:
             raise ValueError(f"Job {job_id} is already running")
 
         job.status = "running"
-        job.started_at = datetime.now().isoformat()
-        job.current_stage = "searching"
+        job.started_at = job.started_at or datetime.now().isoformat()
         self._save_job(job)
 
         try:
@@ -132,6 +152,18 @@ class LiteratureResearchService:
             import sys
             from pathlib import Path
             import os
+
+            # Support ANTHROPIC_AUTH_TOKEN as fallback for ANTHROPIC_API_KEY
+            if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+
+            # Log API key status (without revealing the key)
+            if settings.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY"):
+                logger.info("ANTHROPIC_API_KEY is configured")
+            elif settings.anthropic_auth_token or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                logger.info("ANTHROPIC_AUTH_TOKEN is configured (will be used as ANTHROPIC_API_KEY)")
+            else:
+                logger.warning("No Anthropic API key configured - LLM features will be unavailable")
 
             # Force stdout/stderr to UTF-8 so emoji in 3rd-party scripts don't crash
             try:
@@ -152,45 +184,11 @@ class LiteratureResearchService:
             if settings.https_proxy:
                 os.environ["HTTPS_PROXY"] = settings.https_proxy
 
-            from literature_research.research import run_research
-
-            logger.info(f"Running research: topic={job.topic}, query={job.query}")
-
-            # Run research — offload blocking HTTP calls to thread pool
-            result = await asyncio.to_thread(
-                run_research,
-                job.topic,
-                job.query,
-                max_papers=job.max_papers,
-            )
-
-            # Check if we got any papers
-            if result.get("total_papers", 0) == 0:
-                # Check if there was an implicit error (no papers found)
-                job.status = "failed"
-                job.error_message = "No papers found. Possible causes: (1) Network timeout - check internet connection to PubMed, (2) Query returned no results, (3) API rate limit reached."
-                job.completed_at = datetime.now().isoformat()
-                self._save_job(job)
-                logger.warning(f"Research job {job_id} completed with 0 papers")
-                return job
-
-            # Update job with results
-            job.papers = result.get("papers", [])
-            job.total_papers = result.get("total_papers", 0)
-            job.processed_papers = job.total_papers
-            job.year_range = result.get("year_range", {})
-            job.unique_institutions = result.get("unique_institutions", 0)
-            job.current_stage = "analyzing"
-            # Keep status=running until analysis+report done
-            self._save_job(job)
-            logger.info(f"Research job {job_id} fetched: {job.total_papers} papers, starting analysis")
-
-            # ── 计算输出目录（贯穿后续所有步骤）─────────────────────────────
+            # Compute output directory paths (used by multiple stages)
             import re as _re
             scripts_path = lr_path / "scripts"
             if str(scripts_path) not in sys.path:
                 sys.path.insert(0, str(scripts_path))
-            from generate_report import generate_markdown_report, save_markdown
 
             today = datetime.now().strftime("%Y-%m-%d")
             topic_label = job.topic
@@ -200,100 +198,333 @@ class LiteratureResearchService:
             result_dir = lr_path / "result" / f"{topic_label}调研_{start_date}至{today}"
             result_dir.mkdir(parents=True, exist_ok=True)
 
-            # ── 原始 NCBI Markdown（LLM 分析前的快照）────────────────────────
-            try:
-                raw_md_content = generate_markdown_report(
-                    job.papers, topic_label, date_range, days=0, topic_keyword=job.topic
-                )
-                raw_md_path = result_dir / f"{topic_label}_原始NCBI_{start_date}至{today}.md"
-                save_markdown(raw_md_content, str(raw_md_path))
-                logger.info(f"Raw NCBI Markdown saved: {raw_md_path}")
-            except Exception as raw_err:
-                logger.warning(f"Raw Markdown generation failed (non-fatal): {raw_err}")
-
-            # ── LLM 分析：翻译 + 6维度深度分析（Anthropic SDK，线程池中运行）────
-            def _run_llm_analysis():
-                try:
-                    for _mod in ("utils", "analyze_content"):
-                        sys.modules.pop(_mod, None)
-
-                    from utils import translate_text
-                    from analyze_content import analyze_paper_content, validate_analysis_complete
-                    logger.info("LLM analysis modules loaded (SDK mode)")
-
-                    for idx, paper in enumerate(job.papers, 1):
-                        logger.info(f"[{idx}/{job.total_papers}] 分析: {paper.get('title','')[:60]}")
-                        try:
-                            if paper.get("title"):
-                                paper["title_cn"] = translate_text(paper["title"], type="title")
-                            if paper.get("abstract"):
-                                paper["abstract_cn"] = translate_text(paper["abstract"], type="abstract")
-                            analysis = analyze_paper_content(
-                                paper["title"], paper.get("abstract", ""), paper.get("journal", "")
-                            )
-                            if not validate_analysis_complete(analysis):
-                                import time; time.sleep(3)
-                                analysis = analyze_paper_content(
-                                    paper["title"], paper.get("abstract", ""), paper.get("journal", "")
-                                )
-                            paper.update(analysis)
-                        except Exception as ae:
-                            logger.warning(f"Paper {idx} analysis failed (non-fatal): {ae}")
-                        finally:
-                            job.analyzed_papers = idx
-                            self._save_job(job)
-                    logger.info(f"LLM analysis completed for job {job_id}")
-                except Exception as analysis_err:
-                    logger.warning(f"LLM analysis failed (non-fatal): {analysis_err}")
-
-            await asyncio.to_thread(_run_llm_analysis)
-
-            # ── 富化 Markdown（含翻译 + 6维度分析）──────────────────────────
-            md_path = None
-            try:
-                md_content = generate_markdown_report(
-                    job.papers, topic_label, date_range, days=0, topic_keyword=job.topic
-                )
-                md_path = result_dir / f"{topic_label}_文献调研报告_{start_date}至{today}.md"
-                save_markdown(md_content, str(md_path))
-                job.result_path = str(md_path)
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 1: PubMed Search (with checkpoint resume)
+            # ═══════════════════════════════════════════════════════════════════
+            if not job.stage_completed.get("searching"):
+                job.current_stage = "searching"
                 self._save_job(job)
-                logger.info(f"Enriched Markdown saved: {md_path}")
-            except Exception as report_err:
-                logger.warning(f"Enriched Markdown generation failed (non-fatal): {report_err}")
 
-            # ── 自动转换：Word / HTML阅读版 / HTML-PPT / PDF-PPT ─────────────
-            # 使用 subprocess 运行，避免 Playwright sync API 与 asyncio event loop 冲突
-            if md_path and md_path.exists():
+                from literature_research.research import run_research
+
+                logger.info(f"[Stage 1/4] PubMed search for job {job_id}")
+
+                result = await asyncio.to_thread(
+                    run_research,
+                    job.topic,
+                    job.query,
+                    max_papers=job.max_papers,
+                )
+
+                # Check if we got any papers
+                if result.get("total_papers", 0) == 0:
+                    job.status = "failed"
+                    job.error_message = "No papers found. Possible causes: (1) Network timeout - check internet connection to PubMed, (2) Query returned no results, (3) API rate limit reached."
+                    job.completed_at = datetime.now().isoformat()
+                    self._save_job(job)
+                    logger.warning(f"Research job {job_id} completed with 0 papers")
+                    return job
+
+                # Update job with results
+                job.papers = result.get("papers", [])
+                job.total_papers = result.get("total_papers", 0)
+                job.processed_papers = job.total_papers
+                job.year_range = result.get("year_range", {})
+                job.unique_institutions = result.get("unique_institutions", 0)
+
+                # Initialize paper status tracking
+                for p in job.papers:
+                    pmid = p.get("pmid") or p.get("doi") or str(hash(p.get("title", "")))
+                    job.paper_status[pmid] = {
+                        "translated": False,
+                        "analyzed": False,
+                        "translate_attempts": 0,
+                        "analysis_attempts": 0,
+                    }
+
+                # Mark stage complete
+                job.stage_completed["searching"] = True
+                job.last_successful_stage = "searching"
+                self._save_job(job)
+                logger.info(f"[Stage 1/4] PubMed search completed: {job.total_papers} papers")
+            else:
+                logger.info(f"[Stage 1/4] PubMed search skipped (already completed)")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 2: Semantic Scholar Enrichment (with checkpoint resume)
+            # ═══════════════════════════════════════════════════════════════════
+            if not job.stage_completed.get("enriching"):
+                job.current_stage = "enriching"
+                self._save_job(job)
+
+                logger.info(f"[Stage 2/4] Semantic Scholar enrichment for job {job_id}")
+
+                def _run_s2_enrichment():
+                    try:
+                        for _mod in ("enrich_semantic_scholar",):
+                            sys.modules.pop(_mod, None)
+                        from enrich_semantic_scholar import enrich_papers_with_semantic_scholar
+
+                        network_limit = getattr(settings, "semantic_scholar_network_limit", 100)
+                        enrich_papers_with_semantic_scholar(
+                            job.papers,
+                            api_key=getattr(settings, "semantic_scholar_api_key", ""),
+                            fetch_network=True,
+                            network_limit=network_limit,
+                        )
+                        # Review: check S2 match failures
+                        missing = [p.get("title", "")[:60] for p in job.papers
+                                   if not p.get("s2_paper_id")]
+                        if missing:
+                            msg = f"Semantic Scholar 未匹配 {len(missing)}/{len(job.papers)} 篇（引用数据缺失）"
+                            logger.warning(f"[S2] {msg}: {missing[:3]}")
+                            job.warnings.append(msg)
+                        logger.info(f"S2 enrichment completed for job {job_id}")
+                    except Exception as s2_err:
+                        msg = f"Semantic Scholar 富化失败（引用数据不可用）: {s2_err}"
+                        logger.warning(f"S2 enrichment failed (non-fatal): {s2_err}")
+                        job.warnings.append(msg)
+
+                await asyncio.to_thread(_run_s2_enrichment)
+
+                # Save after enrichment
+                job.stage_completed["enriching"] = True
+                job.last_successful_stage = "enriching"
+                self._save_job(job)
+                logger.info(f"[Stage 2/4] Semantic Scholar enrichment completed")
+            else:
+                logger.info(f"[Stage 2/4] Semantic Scholar enrichment skipped (already completed)")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 3: LLM Analysis (with per-paper checkpoint resume)
+            # ═══════════════════════════════════════════════════════════════════
+            if not job.stage_completed.get("analyzing"):
+                job.current_stage = "analyzing"
+                self._save_job(job)
+
+                logger.info(f"[Stage 3/4] LLM analysis for job {job_id}")
+
+                _FAILED_SENTINEL = "分析失败"
+
+                def _run_llm_analysis():
+                    import time as _t
+                    try:
+                        # Clear module cache to ensure fresh SDK initialization with env vars
+                        for _mod in ("utils", "analyze_content"):
+                            sys.modules.pop(_mod, None)
+
+                        from utils import translate_text
+                        from analyze_content import analyze_paper_content, validate_analysis_complete, _SDK_OK as _llm_ok
+                        logger.info(f"LLM analysis modules loaded (SDK mode: {_llm_ok})")
+
+                        if not _llm_ok:
+                            msg = "LLM SDK 不可用（API Key 未配置或认证失败），翻译和深度分析已跳过。"
+                            if not settings.anthropic_api_key:
+                                msg += " 请在 .env 文件中设置 ANTHROPIC_API_KEY。"
+                            logger.warning(msg)
+                            job.warnings.append(msg)
+                            return
+
+                        _analysis_keys = ["technical_route", "advantages", "limitations",
+                                          "technical_barriers", "feasibility", "generalization"]
+
+                        # Process each paper with individual checkpointing
+                        for idx, paper in enumerate(job.papers, 1):
+                            pmid = paper.get("pmid") or paper.get("doi") or str(hash(paper.get("title", "")))
+                            status = job.paper_status.get(pmid, {})
+
+                            # Skip if already fully processed
+                            if status.get("translated") and status.get("analyzed"):
+                                logger.info(f"[{idx}/{job.total_papers}] Skipping (already processed): {paper.get('title','')[:60]}")
+                                job.analyzed_papers = max(job.analyzed_papers, idx)
+                                continue
+
+                            logger.info(f"[{idx}/{job.total_papers}] Analyzing: {paper.get('title','')[:60]}")
+
+                            try:
+                                # Translation (with individual retry)
+                                if not status.get("translated"):
+                                    if paper.get("title") and not paper.get("title_cn"):
+                                        paper["title_cn"] = translate_text(paper["title"], type="title")
+                                    if paper.get("abstract") and not paper.get("abstract_cn"):
+                                        paper["abstract_cn"] = translate_text(paper["abstract"], type="abstract")
+                                    status["translated"] = True
+                                    status["translate_attempts"] = status.get("translate_attempts", 0) + 1
+
+                                # 6-dimension analysis (with individual retry)
+                                if not status.get("analyzed"):
+                                    analysis = analyze_paper_content(
+                                        paper["title"], paper.get("abstract", ""), paper.get("journal", "")
+                                    )
+                                    if not validate_analysis_complete(analysis):
+                                        _t.sleep(5)
+                                        analysis = analyze_paper_content(
+                                            paper["title"], paper.get("abstract", ""), paper.get("journal", "")
+                                        )
+                                    paper.update(analysis)
+                                    status["analyzed"] = True
+                                    status["analysis_attempts"] = status.get("analysis_attempts", 0) + 1
+
+                                job.analyzed_papers = idx
+
+                            except Exception as ae:
+                                logger.warning(f"Paper {idx} analysis failed (non-fatal): {ae}")
+                                status["translate_attempts"] = status.get("translate_attempts", 0) + 1
+                                status["analysis_attempts"] = status.get("analysis_attempts", 0) + 1
+                                # Continue to next paper, don't fail entire job
+
+                            finally:
+                                # Save progress after each paper
+                                job.paper_status[pmid] = status
+                                self._save_job(job)
+
+                        # Post-analysis: retry failed papers
+                        logger.info(f"[Review] Checking {len(job.papers)} papers for completeness...")
+                        retry_needed = []
+                        for p in job.papers:
+                            pmid = p.get("pmid") or p.get("doi") or str(hash(p.get("title", "")))
+                            status = job.paper_status.get(pmid, {})
+                            missing = []
+                            if not (p.get("abstract_cn") or "").strip() and not status.get("translated"):
+                                missing.append("中文摘要")
+                            if any((p.get(k) or "") in (_FAILED_SENTINEL, "", "摘要缺失，无法分析")
+                                   for k in _analysis_keys):
+                                missing.append("深度分析")
+                            if missing:
+                                retry_needed.append((p, missing, pmid))
+
+                        if retry_needed:
+                            logger.info(f"[Review] Found {len(retry_needed)} papers needing retry...")
+                            for p, missing, pmid in retry_needed:
+                                title_short = p.get("title", "")[:50]
+                                logger.info(f"[Retry] {title_short} — missing: {missing}")
+                                try:
+                                    if "中文摘要" in missing and p.get("abstract"):
+                                        p["abstract_cn"] = translate_text(p["abstract"], type="abstract")
+                                    if "深度分析" in missing:
+                                        analysis = analyze_paper_content(
+                                            p["title"], p.get("abstract", ""), p.get("journal", "")
+                                        )
+                                        p.update(analysis)
+                                    # Mark as complete on successful retry
+                                    job.paper_status[pmid]["translated"] = True
+                                    job.paper_status[pmid]["analyzed"] = True
+                                except Exception as re_err:
+                                    logger.warning(f"[Retry] Failed: {re_err}")
+                                    job.paper_status[pmid]["failed"] = True
+
+                            self._save_job(job)
+
+                        # Final review: generate warnings
+                        failed_analysis = [p.get("title", "")[:50] for p in job.papers
+                                           if any((p.get(k) or "") in (_FAILED_SENTINEL, "摘要缺失，无法分析")
+                                                  for k in _analysis_keys)]
+                        failed_trans = [p.get("title", "")[:50] for p in job.papers
+                                        if not (p.get("abstract_cn") or "").strip() and p.get("abstract")]
+
+                        if failed_analysis:
+                            msg = (f"深度分析失败 {len(failed_analysis)}/{len(job.papers)} 篇"
+                                   f"（可能原因：LLM API 过载或网络抖动）")
+                            logger.warning(f"[Review] {msg}")
+                            job.warnings.append(msg)
+                        if failed_trans:
+                            msg = (f"中文翻译失败 {len(failed_trans)}/{len(job.papers)} 篇"
+                                   f"（可能原因：LLM API 不可用）")
+                            logger.warning(f"[Review] {msg}")
+                            job.warnings.append(msg)
+
+                        if not failed_analysis and not failed_trans:
+                            logger.info(f"[Review] Passed: all {len(job.papers)} papers analyzed completely")
+
+                        logger.info(f"LLM analysis completed for job {job_id}")
+
+                    except Exception as analysis_err:
+                        msg = f"LLM 分析流程异常中断: {analysis_err}"
+                        logger.warning(f"LLM analysis failed (non-fatal): {analysis_err}")
+                        job.warnings.append(msg)
+
+                await asyncio.to_thread(_run_llm_analysis)
+
+                # Mark stage complete
+                job.stage_completed["analyzing"] = True
+                job.last_successful_stage = "analyzing"
+                self._save_job(job)
+                logger.info(f"[Stage 3/4] LLM analysis completed")
+            else:
+                logger.info(f"[Stage 3/4] LLM analysis skipped (already completed)")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 4: Report Generation (with checkpoint resume)
+            # ═══════════════════════════════════════════════════════════════════
+            if not job.stage_completed.get("converting"):
                 job.current_stage = "converting"
                 self._save_job(job)
-                try:
-                    import subprocess
-                    md_to_reports_script = scripts_path / "md_to_reports.py"
-                    proc = await asyncio.to_thread(
-                        subprocess.run,
-                        [
-                            sys.executable,
-                            str(md_to_reports_script),
-                            "--input", str(md_path),
-                            "--output-dir", str(result_dir),
-                            "--formats", "word", "html", "html_ppt", "pdf_ppt",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=600,
-                    )
-                    if proc.stdout:
-                        logger.info(f"Conversion output:\n{proc.stdout.strip()}")
-                    if proc.stderr:
-                        logger.warning(f"Conversion stderr:\n{proc.stderr.strip()[:500]}")
-                    logger.info(f"Auto-conversion completed (exit {proc.returncode}) for job {job_id}")
-                except Exception as conv_err:
-                    logger.warning(f"Auto-conversion failed (non-fatal): {conv_err}")
 
-            # ── 最终标记完成 ─────────────────────────────────────────────────
+                logger.info(f"[Stage 4/4] Report generation for job {job_id}")
+
+                from generate_report import generate_markdown_report, save_markdown
+
+                md_path = None
+                try:
+                    md_content = generate_markdown_report(
+                        job.papers, topic_label, date_range, days=0, topic_keyword=job.topic
+                    )
+                    md_path = result_dir / f"{topic_label}_文献调研报告_{start_date}至{today}.md"
+                    save_markdown(md_content, str(md_path))
+                    job.result_path = str(md_path)
+                    self._save_job(job)
+                    logger.info(f"Enriched Markdown saved: {md_path}")
+                except Exception as report_err:
+                    logger.warning(f"Enriched Markdown generation failed (non-fatal): {report_err}")
+
+                # Auto-conversion: Word / HTML / HTML-PPT / PDF-PPT
+                if md_path and md_path.exists():
+                    try:
+                        import subprocess
+                        md_to_reports_script = scripts_path / "md_to_reports.py"
+                        proc = await asyncio.to_thread(
+                            subprocess.run,
+                            [
+                                sys.executable,
+                                str(md_to_reports_script),
+                                "--input", str(md_path),
+                                "--output-dir", str(result_dir),
+                                "--formats", "word", "html", "html_ppt", "pdf_ppt",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=600,
+                        )
+                        if proc.stdout:
+                            logger.info(f"Conversion output:\n{proc.stdout.strip()}")
+                        if proc.stderr:
+                            logger.warning(f"Conversion stderr:\n{proc.stderr.strip()[:500]}")
+                        logger.info(f"Auto-conversion completed (exit {proc.returncode}) for job {job_id}")
+                    except Exception as conv_err:
+                        logger.warning(f"Auto-conversion failed (non-fatal): {conv_err}")
+
+                    # Pre-build ZIP
+                    try:
+                        await asyncio.to_thread(
+                            self._prebuild_zip, job, md_path, result_dir
+                        )
+                        logger.info(f"Pre-built ZIP ready for job {job_id}")
+                    except Exception as zip_err:
+                        logger.warning(f"Pre-built ZIP failed (non-fatal): {zip_err}")
+
+                # Mark stage complete
+                job.stage_completed["converting"] = True
+                job.last_successful_stage = "converting"
+                self._save_job(job)
+                logger.info(f"[Stage 4/4] Report generation completed")
+            else:
+                logger.info(f"[Stage 4/4] Report generation skipped (already completed)")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FINAL: Mark job complete
+            # ═══════════════════════════════════════════════════════════════════
             job.status = "completed"
             job.current_stage = "completed"
             job.completed_at = datetime.now().isoformat()
@@ -305,14 +536,144 @@ class LiteratureResearchService:
         except Exception as e:
             logger.exception(f"Research job {job_id} failed")
             job.status = "failed"
-            job.error_message = f"{str(e)}. Note: PubMed API may not be accessible from your network."
-            job.completed_at = datetime.now().isoformat()
+            job.error_message = f"{str(e)}. Note: Network or API instability may have caused this failure. You can retry the job to resume from the last successful stage ({job.last_successful_stage or 'none'})."
+            job.stage_retry_count += 1
             self._save_job(job)
             return job
+
+    def _prebuild_zip(self, job: "ResearchJob", md_path: Path, result_dir: Path) -> None:
+        """Build a zip archive of all report files and save it to disk.
+
+        The zip is stored as ``<result_dir>/<topic>_<job_id[:8]>_reports.zip``.
+        ``job.zip_path`` is updated and the job is persisted so the download
+        endpoint can serve the file directly without re-building it.
+        """
+        import io
+        import zipfile
+
+        # ── Raw paper-list Markdown (same content as the download endpoint) ──
+        yr = job.year_range or {}
+        md_lines = [
+            f"# 文献调研报告：{job.topic}",
+            "",
+            f"**查询**：`{job.query}`",
+            f"**最大文献数**：{job.max_papers}",
+            f"**实际获取**：{job.total_papers}",
+            f"**年份范围**：{yr.get('min', 'N/A')} – {yr.get('max', 'N/A')}",
+            f"**创建时间**：{job.created_at}",
+            f"**完成时间**：{job.completed_at}",
+            "", "---", "", "## 文献列表", "",
+        ]
+        for i, p in enumerate(job.papers, 1):
+            md_lines.append(f"### {i}. {p.get('title', '无标题')}")
+            md_lines.append("")
+            display = p.get("author_display") or p.get("first_author", "Unknown")
+            md_lines.append(f"- **作者**: {display}")
+            md_lines.append(
+                f"- **期刊**: {p.get('journal', '')} (IF: {p.get('journal_if', 'N/A')})"
+            )
+            md_lines.append(f"- **年份**: {p.get('year', '')}")
+            if p.get("pmid"):
+                md_lines.append(f"- **PMID**: {p['pmid']}")
+            if p.get("doi"):
+                md_lines.append(f"- **DOI**: {p['doi']}")
+            abstract = p.get("abstract", "")
+            if abstract and abstract not in ("No abstract", ""):
+                md_lines.append(f"- **摘要**: {abstract}")
+            md_lines.append("")
+        raw_md_bytes = "\n".join(md_lines).encode("utf-8")
+        raw_md_name = f"{job.topic}_{job.job_id[:8]}_raw.md"
+
+        # ── Collect all disk files from result_dir ───────────────────────────
+        stem = md_path.stem
+        target_map = {
+            "report_md": md_path,
+            "word":      result_dir / f"{stem}.docx",
+            "html":      result_dir / f"{stem}_阅读版.html",
+            "html_ppt":  result_dir / f"{stem}_ppt.html",
+            "pdf_ppt":   result_dir / f"{stem}_ppt.pdf",
+        }
+
+        zip_name = f"{job.topic}_{job.job_id[:8]}_reports.zip"
+        zip_path = result_dir / zip_name
+
+        with zipfile.ZipFile(str(zip_path), "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr(raw_md_name, raw_md_bytes)
+            for fp in target_map.values():
+                if fp.exists():
+                    zf.write(str(fp), fp.name)
+
+        job.zip_path = str(zip_path)
+        self._save_job(job)
+        logger.info(f"Pre-built ZIP saved: {zip_path} ({zip_path.stat().st_size // 1024} KB)")
 
     def get_job(self, job_id: str) -> Optional[ResearchJob]:
         """Get job by ID."""
         return self.jobs.get(job_id)
+
+    async def retry_job(self, job_id: str) -> ResearchJob:
+        """Retry a failed job, resuming from the last successful stage.
+
+        This allows recovery from network instability or LLM API failures
+        without losing progress on completed stages.
+        """
+        job = self.jobs.get(job_id)
+        if not job:
+            raise ValueError(f"Job {job_id} not found")
+
+        if job.status == "running":
+            raise ValueError(f"Job {job_id} is already running")
+
+        if job.status == "completed":
+            raise ValueError(f"Job {job_id} is already completed")
+
+        # Reset status but keep checkpoint data
+        job.status = "pending"
+        job.error_message = ""
+        job.current_stage = job.last_successful_stage or ""
+
+        logger.info(f"Retrying job {job_id}: resuming from stage '{job.current_stage or 'beginning'}' "
+                    f"(stages completed: {job.stage_completed})")
+
+        self._save_job(job)
+
+        # Run the job - it will skip completed stages automatically
+        return await self.run_job(job_id)
+
+    def reset_job(self, job_id: str) -> ResearchJob:
+        """Reset a job to initial state, clearing all progress.
+
+        Use this when you want to start fresh rather than resume.
+        """
+        job = self.jobs.get(job_id)
+        if not job:
+            raise ValueError(f"Job {job_id} not found")
+
+        if job.status == "running":
+            raise ValueError(f"Cannot reset running job {job_id}")
+
+        # Clear all checkpoint data
+        job.status = "pending"
+        job.error_message = ""
+        job.current_stage = ""
+        job.last_successful_stage = ""
+        job.stage_completed = {
+            "searching": False,
+            "enriching": False,
+            "analyzing": False,
+            "converting": False,
+        }
+        job.paper_status = {}
+        job.papers = []
+        job.total_papers = 0
+        job.processed_papers = 0
+        job.analyzed_papers = 0
+        job.stage_retry_count = 0
+        job.warnings = []
+
+        logger.info(f"Reset job {job_id} to initial state")
+        self._save_job(job)
+        return job
 
     def delete_job(self, job_id: str) -> bool:
         """Delete a job, its metadata file, and its result folder on disk.

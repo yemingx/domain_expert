@@ -226,6 +226,7 @@ def generate_ppt_html_report(
       border: 1px solid #d6e4f7;
       border-radius: 10px;
       padding: 14px;
+      flex: 0 0 auto;
     }
     .abstract-box-ppt .ab-lang {
       font-size: 0.7rem;
@@ -244,9 +245,9 @@ def generate_ppt_html_report(
     .dims-ppt-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      grid-template-rows: repeat(2, 1fr);
+      grid-template-rows: repeat(2, auto);
       gap: 14px;
-      height: 100%;
+    }
     }
     .dim-ppt-card {
       background: #f7faff;
@@ -328,13 +329,15 @@ def generate_ppt_html_report(
       .slide {
         margin: 0;
         width: 1280px;
+        /* 不设固定高度，不截断内容；每张幻灯片占一页，高度由内容决定 */
         min-height: 720px;
-        height: 720px;
         page-break-after: always;
         page-break-inside: avoid;
         box-shadow: none;
-        overflow: hidden;
+        overflow: visible;
       }
+      /* 保留链接颜色与下划线，确保 DOI/PMID 在 PDF 中可见可点 */
+      a, a:visited { color: #0055aa !important; text-decoration: underline !important; }
     }
     """
 

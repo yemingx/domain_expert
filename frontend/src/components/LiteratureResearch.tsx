@@ -14,7 +14,8 @@ import {
   Descriptions,
   Modal,
   Popconfirm,
-  Checkbox,
+  Alert,
+  List,
 } from 'antd';
 import {
   SearchOutlined,
@@ -27,7 +28,7 @@ import {
   ClockCircleOutlined,
   DeleteOutlined,
   DownloadOutlined,
-  FileTextOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -37,20 +38,13 @@ import {
   importResearchToKB,
   deleteResearchJob,
   getResearchDownloadUrl,
-  convertResearchReport,
+  retryResearchJob,
+  resetResearchJob,
 } from '../utils/api';
 import type { ResearchJob } from '../types';
 
 const { Text, Paragraph } = Typography;
 const { TextArea } = Input;
-
-const ALL_FORMATS = ['word', 'html', 'html_ppt', 'pdf_ppt'];
-const FORMAT_LABELS: Record<string, string> = {
-  word: 'Word (.docx)',
-  html: 'HTML 阅读版',
-  html_ppt: 'HTML PPT',
-  pdf_ppt: 'PDF PPT',
-};
 
 interface FormValues {
   topic: string;
@@ -64,8 +58,7 @@ export default function LiteratureResearch() {
   const [pollingJobId, setPollingJobId] = useState<string | null>(null);
   const [selectedJob, setSelectedJob] = useState<ResearchJob | null>(null);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
-  const [convertFormats, setConvertFormats] = useState<string[]>(ALL_FORMATS);
-  const [convertingJobId, setConvertingJobId] = useState<string | null>(null);
+  const [downloadingJobId, setDownloadingJobId] = useState<string | null>(null);
 
   // Query all jobs
   const { data: jobs = [], isLoading: jobsLoading, refetch } = useQuery({
@@ -125,6 +118,32 @@ export default function LiteratureResearch() {
     },
   });
 
+  const retryMutation = useMutation({
+    mutationFn: retryResearchJob,
+    onSuccess: (data) => {
+      message.success(`Retrying job from stage: ${data.last_successful_stage || 'beginning'}`);
+      setPollingJobId(data.job_id);
+      queryClient.invalidateQueries({ queryKey: ['research-jobs'] });
+    },
+    onError: (error: any) => {
+      message.error(`Retry failed: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
+  const resetMutation = useMutation({
+    mutationFn: resetResearchJob,
+    onSuccess: (data) => {
+      message.success('Job reset to initial state');
+      queryClient.invalidateQueries({ queryKey: ['research-jobs'] });
+      if (selectedJob?.job_id === data.job_id) {
+        setSelectedJob(data);
+      }
+    },
+    onError: (error: any) => {
+      message.error(`Reset failed: ${error.response?.data?.detail || error.message}`);
+    },
+  });
+
   const handleSubmit = (values: FormValues) => {
     runMutation.mutate(values);
   };
@@ -133,27 +152,32 @@ export default function LiteratureResearch() {
     importMutation.mutate(jobId);
   };
 
-  const handleConvert = async (jobId: string) => {
-    if (convertFormats.length === 0) {
-      message.warning('请至少选择一种格式');
-      return;
-    }
-    setConvertingJobId(jobId);
+  const handleDownload = async (jobId: string) => {
+    setDownloadingJobId(jobId);
     try {
-      const blob = await convertResearchReport(jobId, convertFormats);
+      const response = await fetch(getResearchDownloadUrl(jobId));
+      if (!response.ok) {
+        const text = await response.text();
+        let detail = text;
+        try { detail = JSON.parse(text).detail; } catch { /* ignore */ }
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+      const disposition = response.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+        || disposition.match(/filename="([^"]+)"/i);
+      const filename = match ? decodeURIComponent(match[1]) : `${jobId.slice(0, 8)}_reports.zip`;
+      const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `report_${jobId.slice(0, 8)}.zip`;
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(url);
-      message.success('报告已生成并下载');
-      queryClient.invalidateQueries({ queryKey: ['research-jobs'] });
-      queryClient.invalidateQueries({ queryKey: ['research-job', jobId] });
+      message.success('下载完成');
     } catch (err: any) {
-      message.error(`生成失败: ${err.response?.data?.detail || err.message}`);
+      message.error(`下载失败: ${err.message}`);
     } finally {
-      setConvertingJobId(null);
+      setDownloadingJobId(null);
     }
   };
 
@@ -223,10 +247,17 @@ export default function LiteratureResearch() {
     {
       title: 'Actions',
       key: 'actions',
-      width: 420,
+      width: 320,
       render: (_: any, record: ResearchJob) => (
         <Space wrap>
           <Button size="small" onClick={() => showJobDetail(record)}>Details</Button>
+          {record.status === 'failed' && (
+            <Button size="small" type="primary" icon={<ReloadOutlined />}
+              onClick={() => retryMutation.mutate(record.job_id)}
+              loading={retryMutation.isPending && pollingJobId === record.job_id}>
+              Retry
+            </Button>
+          )}
           {record.status === 'completed' && (
             <Button size="small" type="primary" icon={<ImportOutlined />}
               onClick={() => handleImport(record.job_id)}
@@ -234,16 +265,10 @@ export default function LiteratureResearch() {
               Import
             </Button>
           )}
-          {record.status === 'completed' && record.result_path && (
-            <Button size="small" icon={<FileTextOutlined />}
-              loading={convertingJobId === record.job_id}
-              onClick={() => handleConvert(record.job_id)}>
-              生成报告
-            </Button>
-          )}
           {record.status === 'completed' && (
             <Button size="small" icon={<DownloadOutlined />}
-              onClick={() => window.open(getResearchDownloadUrl(record.job_id))}>
+              loading={downloadingJobId === record.job_id}
+              onClick={() => handleDownload(record.job_id)}>
               Download
             </Button>
           )}
@@ -267,6 +292,21 @@ export default function LiteratureResearch() {
         <Paragraph type="secondary">
           Run automated PubMed literature research. Enter a topic and NCBI query string.
         </Paragraph>
+        <Alert
+          type="info"
+          showIcon
+          message="请先确认 PubMed 检索式"
+          description={
+            <span>
+              建议先通过{' '}
+              <a href="https://pubmed.ncbi.nlm.nih.gov/advanced/" target="_blank" rel="noopener noreferrer">
+                PubMed Advanced Search
+              </a>
+              {' '}确认检索式能返回预期结果，然后将确认好的检索式输入到下方的 NCBI/PubMed Query 中。
+            </span>
+          }
+          style={{ marginBottom: 16 }}
+        />
 
         <Form form={form} layout="vertical" onFinish={handleSubmit}
           initialValues={{ topic: 'NIPD', query: 'NIPD[Title/Abstract] AND monogenic[Title/Abstract]', max_papers: 50 }}>
@@ -315,23 +355,43 @@ export default function LiteratureResearch() {
                     : `${pct}% (${activeJob.processed_papers}/${activeJob.total_papers})`
                 }
               />
+              {activeJob.warnings && activeJob.warnings.length > 0 && (
+                <Alert
+                  type="warning"
+                  icon={<WarningOutlined />}
+                  showIcon
+                  message={`注意：${activeJob.warnings.length} 项部分失败`}
+                  description={
+                    <List
+                      size="small"
+                      dataSource={activeJob.warnings}
+                      renderItem={(w) => <List.Item style={{ padding: '2px 0', fontSize: 12 }}>{w}</List.Item>}
+                    />
+                  }
+                />
+              )}
             </Space>
           </Card>
         )}
-      </Card>
 
-      {/* Report Format Selection */}
-      <Card title="报告格式选择" size="small">
-        <Space direction="vertical">
-          <Text type="secondary">
-            点击"生成报告"时生成以下格式（需要 job 已完成且含深度分析的 Markdown）：
-          </Text>
-          <Checkbox.Group
-            options={ALL_FORMATS.map(f => ({ label: FORMAT_LABELS[f], value: f }))}
-            value={convertFormats}
-            onChange={(vals) => setConvertFormats(vals as string[])}
+        {/* Completed job warnings (shown below active card area) */}
+        {activeJob && activeJob.status === 'completed' && activeJob.warnings && activeJob.warnings.length > 0 && (
+          <Alert
+            style={{ marginTop: 16 }}
+            type="warning"
+            icon={<WarningOutlined />}
+            showIcon
+            message={`任务完成，但有 ${activeJob.warnings.length} 项部分失败`}
+            description={
+              <List
+                size="small"
+                dataSource={activeJob.warnings}
+                renderItem={(w) => <List.Item style={{ padding: '2px 0', fontSize: 12 }}>{w}</List.Item>}
+              />
+            }
+            closable
           />
-        </Space>
+        )}
       </Card>
 
       {/* Jobs List */}
@@ -349,17 +409,28 @@ export default function LiteratureResearch() {
         width={800}
         footer={[
           <Button key="close" onClick={() => setIsDetailModalOpen(false)}>Close</Button>,
-          selectedJob?.status === 'completed' && selectedJob?.result_path ? (
-            <Button key="convert" icon={<FileTextOutlined />}
-              loading={convertingJobId === selectedJob?.job_id}
-              onClick={() => selectedJob && handleConvert(selectedJob.job_id)}>
-              生成报告 (zip)
+          selectedJob?.status === 'failed' && (
+            <Popconfirm
+              key="reset"
+              title="Reset this job?"
+              description="This will clear all progress and start fresh."
+              onConfirm={() => selectedJob && resetMutation.mutate(selectedJob.job_id)}
+              okText="Reset" cancelText="Cancel">
+              <Button loading={resetMutation.isPending}>Reset</Button>
+            </Popconfirm>
+          ),
+          selectedJob?.status === 'failed' && (
+            <Button key="retry" type="primary" icon={<ReloadOutlined />}
+              loading={retryMutation.isPending}
+              onClick={() => selectedJob && retryMutation.mutate(selectedJob.job_id)}>
+              Retry from Checkpoint
             </Button>
-          ) : null,
+          ),
           selectedJob?.status === 'completed' ? (
             <Button key="download" icon={<DownloadOutlined />}
-              onClick={() => selectedJob && window.open(getResearchDownloadUrl(selectedJob.job_id))}>
-              Download CSV+JSON
+              loading={downloadingJobId === selectedJob?.job_id}
+              onClick={() => selectedJob && handleDownload(selectedJob.job_id)}>
+              Download
             </Button>
           ) : null,
           selectedJob?.status === 'completed' ? (
@@ -383,6 +454,39 @@ export default function LiteratureResearch() {
             <Descriptions.Item label="Max Papers">{selectedJob.max_papers}</Descriptions.Item>
             <Descriptions.Item label="Status">{getStatusTag(selectedJob.status)}</Descriptions.Item>
             <Descriptions.Item label="Stage">{selectedJob.current_stage || '—'}</Descriptions.Item>
+            {/* Checkpoint Status */}
+            {selectedJob.stage_completed && (
+              <Descriptions.Item label="Completed Stages">
+                <Space direction="vertical" size={0}>
+                  {Object.entries(selectedJob.stage_completed).map(([stage, completed]) => (
+                    <Space key={stage}>
+                      {completed ? (
+                        <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                      ) : (
+                        <ClockCircleOutlined style={{ color: '#d9d9d9' }} />
+                      )}
+                      <Text style={{ fontSize: 12, color: completed ? undefined : '#999' }}>
+                        {stage === 'searching' && '文献检索 (PubMed)'}
+                        {stage === 'enriching' && '引用富化 (Semantic Scholar)'}
+                        {stage === 'analyzing' && '深度分析 (LLM)'}
+                        {stage === 'converting' && '报告生成'}
+                        {completed ? ' ✓' : ' (pending)'}
+                      </Text>
+                    </Space>
+                  ))}
+                </Space>
+              </Descriptions.Item>
+            )}
+            {selectedJob.last_successful_stage && (
+              <Descriptions.Item label="Resume From">
+                <Tag color="blue">{selectedJob.last_successful_stage}</Tag>
+                {selectedJob.stage_retry_count ? (
+                  <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+                    (retried {selectedJob.stage_retry_count} time{selectedJob.stage_retry_count > 1 ? 's' : ''})
+                  </Text>
+                ) : null}
+              </Descriptions.Item>
+            )}
             <Descriptions.Item label="Progress">
               {selectedJob.processed_papers} / {selectedJob.total_papers} papers
             </Descriptions.Item>
@@ -402,8 +506,34 @@ export default function LiteratureResearch() {
               </Descriptions.Item>
             )}
             {selectedJob.error_message && (
-              <Descriptions.Item label="Error">
-                <Text type="danger">{selectedJob.error_message}</Text>
+              <Descriptions.Item label="错误">
+                <Alert
+                  type="error"
+                  message={selectedJob.error_message}
+                  description={
+                    selectedJob.last_successful_stage ? (
+                      <Text type="secondary">
+                        提示：可以从已完成的阶段继续运行，点击 Retry from Checkpoint 按钮
+                      </Text>
+                    ) : null
+                  }
+                  showIcon
+                />
+              </Descriptions.Item>
+            )}
+            {selectedJob.warnings && selectedJob.warnings.length > 0 && (
+              <Descriptions.Item label={
+                <Space><WarningOutlined style={{ color: '#faad14' }} /><span>部分失败</span></Space>
+              }>
+                <List
+                  size="small"
+                  dataSource={selectedJob.warnings}
+                  renderItem={(w) => (
+                    <List.Item style={{ padding: '3px 0' }}>
+                      <Text type="warning" style={{ fontSize: 12 }}>{w}</Text>
+                    </List.Item>
+                  )}
+                />
               </Descriptions.Item>
             )}
           </Descriptions>

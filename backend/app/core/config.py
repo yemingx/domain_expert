@@ -1,7 +1,30 @@
 """Application settings loaded from environment variables."""
 
+import json
+import os
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from typing import Optional
+
+
+def _load_claude_settings() -> dict:
+    """Load settings from Claude's settings.json if it exists."""
+    claude_settings_path = Path.home() / ".claude" / "settings.json"
+    if claude_settings_path.exists():
+        try:
+            with open(claude_settings_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get("env", {})
+        except Exception:
+            pass
+    return {}
+
+
+# Load Claude settings and set as environment variables if not already set
+_claude_env = _load_claude_settings()
+for key, value in _claude_env.items():
+    if key not in os.environ:
+        os.environ[key] = value
 
 
 class Settings(BaseSettings):
@@ -36,6 +59,12 @@ class Settings(BaseSettings):
     # Proxy settings for external APIs (PubMed, etc.)
     http_proxy: str = ""  # e.g., "http://proxy.company.com:8080"
     https_proxy: str = ""  # e.g., "http://proxy.company.com:8080"
+
+    # Semantic Scholar API (optional — increases rate limit from 1/s to 10/s)
+    semantic_scholar_api_key: str = ""
+    # Max corpus size for fetching citation network (references + citations_in per paper)
+    # Set to 0 to disable network fetching entirely
+    semantic_scholar_network_limit: int = 100
 
     model_config = {
         "env_file": "../.env",
