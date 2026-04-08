@@ -27,6 +27,7 @@ from app.services.literature_research_service import (
     get_research_service,
     ResearchJob,
 )
+from app.services.research_report_parser import list_available_reports, parse_report
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -123,7 +124,8 @@ async def run_research(request: ResearchRequest):
         max_papers=request.max_papers,
     )
     # Run in background
-    asyncio.create_task(service.run_job(job.job_id))
+    task = asyncio.create_task(service.run_job(job.job_id))
+    service._running_tasks[job.job_id] = task
     return _job_to_response(job)
 
 
@@ -146,11 +148,11 @@ async def get_research_job(job_id: str):
 
 
 @router.delete("/research/jobs/{job_id}")
-async def delete_research_job(job_id: str):
-    """Delete a research job and its data file."""
+async def delete_research_job(job_id: str, force: bool = False):
+    """Delete a research job and its data file. Use force=true to stop and delete a running job."""
     service = get_research_service()
     try:
-        deleted = service.delete_job(job_id)
+        deleted = service.delete_job(job_id, force=force)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not deleted:
@@ -177,7 +179,8 @@ async def retry_research_job(job_id: str):
         raise HTTPException(status_code=400, detail="Job is already completed")
 
     # Retry the job - this will resume from the last successful stage
-    asyncio.create_task(service.retry_job(job_id))
+    task = asyncio.create_task(service.retry_job(job_id))
+    service._running_tasks[job_id] = task
     return _job_to_response(job)
 
 
@@ -374,6 +377,12 @@ async def convert_research_report(job_id: str, request: ConvertRequest = None):
         raise HTTPException(status_code=404, detail="Markdown report not found; re-run the job to regenerate")
 
     formats = (request.formats if request else None) or ["word", "html", "html_ppt", "pdf_ppt"]
+
+    if getattr(job, "total_papers", 0) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文献数量为 {job.total_papers} 篇，超过 100 篇上限，不支持生成 HTML/PDF 报告，请直接下载 Markdown 原文。",
+        )
 
     scripts_dir = Path(__file__).parent.parent.parent / "literature_research" / "scripts"
     if str(scripts_dir) not in sys.path:
@@ -981,381 +990,126 @@ async def get_stats():
     }
 
 
-# --- Hypergraph Timeline Analysis (NEW) ---
-
-class HypergraphTimelineRequest(BaseModel):
-    job_id: str
-    analysis_depth: str = "full"  # summary, full, detailed
-    include_collaboration: bool = True
-    include_influence: bool = True
-    include_milestones: bool = True
+# --- Hypergraph Timeline Analysis (Report-based) ---
 
 
-@router.post("/knowledge/hypergraph-timeline")
-async def get_hypergraph_timeline(request: HypergraphTimelineRequest):
-    """Get hypergraph-based timeline analysis from research results.
+class HypergraphFromReportRequest(BaseModel):
+    file_path: str
+    min_impact_factor: float = 2.0
+    date_start: Optional[str] = None  # "YYYY-MM-DD"
+    date_end: Optional[str] = None    # "YYYY-MM-DD"
 
-    This endpoint constructs a hypergraph where:
-    - Nodes: authors, papers, time periods, institutions, concepts
-    - Hyperedges: represent multi-dimensional relationships
-    - Extracts: collaboration networks, community influence, milestones, debates
+
+@router.get("/knowledge/reports")
+async def get_available_reports():
+    """List available literature research reports."""
+    return list_available_reports()
+
+
+@router.post("/knowledge/hypergraph-from-report")
+async def get_hypergraph_from_report(request: HypergraphFromReportRequest):
+    """Build a hypergraph from a literature research report.
+
+    Nodes: authors (first + corresponding) and papers.
+    Edges: authorship (author->paper) and coauthorship (first<->corresponding).
+    Importance: paper=IF, author=weighted IF sum + paper count bonus.
     """
-    service = get_research_service()
-    job = service.get_job(request.job_id)
-
-    if not job:
-        raise HTTPException(status_code=404, detail="Research job not found")
-    if job.status != "completed":
-        raise HTTPException(status_code=400, detail="Research job not completed yet")
-
     try:
-        llm = get_llm_service()
+        report = parse_report(request.file_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Report file not found")
 
-        # Build hypergraph data structure
-        hypergraph = _build_hypergraph_from_papers(job.papers)
-
-        # Generate analysis using LLM
-        analysis_prompt = _build_hypergraph_analysis_prompt(
-            hypergraph,
-            request.analysis_depth,
-            request.include_collaboration,
-            request.include_influence,
-            request.include_milestones,
-        )
-
-        analysis_result = llm.chat(
-            messages=[{"role": "user", "content": analysis_prompt}],
-            system="""You are a research network analyst specializing in hypergraph analysis.
-Analyze the provided hypergraph data and extract insights about:
-1. Collaboration networks (who works with whom)
-2. Community influence (key opinion leaders)
-3. Research evolution over time (milestones, paradigm shifts)
-4. Academic debates and consensus areas
-
-Respond in JSON format with the following structure:
-{
-  "summary": "Brief overview of the research landscape",
-  "key_figures": [{"name": "", "role": "", "influence_score": 0, "institution": ""}],
-  "collaboration_clusters": [{"id": "", "members": [], "institution": "", "paper_count": 0}],
-  "milestones": [{"year": 0, "event": "", "significance": "", "key_papers": []}],
-  "debates": [{"topic": "", "sides": [], "status": "ongoing|resolved"}],
-  "consensus_areas": ["topic1", "topic2"],
-  "temporal_patterns": "Description of how research evolved over time"
-}""",
-            max_tokens=8000,
-            temperature=0.3,
-        )
-
-        # Parse LLM response
-        try:
-            analysis_json = json.loads(analysis_result)
-        except json.JSONDecodeError:
-            analysis_json = {"raw_analysis": analysis_result}
-
-        return {
-            "job_id": request.job_id,
-            "topic": job.topic,
-            "hypergraph": hypergraph,
-            "analysis": analysis_json,
-            "statistics": {
-                "total_papers": len(job.papers),
-                "total_authors": len(hypergraph["nodes"]["authors"]),
-                "total_institutions": len(hypergraph["nodes"]["institutions"]),
-                "time_range": (lambda yrs: {
-                    "start": min(yrs) if yrs else None,
-                    "end": max(yrs) if yrs else None,
-                })([p.get("year") for p in job.papers if p.get("year")]),
-            },
-        }
-
-    except Exception as e:
-        logger.error(f"Hypergraph timeline error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
-    """Build hypergraph data structure from papers (dict format).
-
-    Nodes: authors, papers, time periods, institutions, concepts
-    Hyperedges: co-authorship, citation, temporal proximity, institutional affiliation
-
-    If papers have been enriched with Semantic Scholar data, citation edges are
-    added for within-corpus references and paper nodes include citation_count,
-    influential_citation_count, s2_url.
-    """
-    nodes = {
-        "authors": {},
-        "papers": {},
-        "institutions": {},
-        "time_periods": {},
-        "concepts": {},
-    }
-    hyperedges = []
-
-    # Build a lookup set for fast within-corpus detection: doi and pmid → paper_id
-    corpus_doi_map: dict[str, str] = {}   # doi → paper_id
-    corpus_pmid_map: dict[str, str] = {}  # pmid → paper_id
-    for paper in papers:
-        pid = paper.get("pmid") or paper.get("doi") or paper.get("title", "")[:50]
-        if paper.get("doi"):
-            corpus_doi_map[paper["doi"].lower().strip()] = pid
-        if paper.get("pmid"):
-            corpus_pmid_map[str(paper["pmid"]).strip()] = pid
-
-    # Build author and paper nodes
-    for paper in papers:
-        # Paper node
-        paper_id = paper.get("pmid") or paper.get("doi") or paper.get("title", "")[:50]
-        nodes["papers"][paper_id] = {
-            "id": paper_id,
-            "title": paper.get("title", ""),
-            "year": paper.get("year", 0),
-            "month": paper.get("month", 0),
-            "journal": paper.get("journal", ""),
-            "journal_if": paper.get("journal_if", ""),
-            "citation_count": paper.get("citation_count", 0),
-            "influential_citation_count": paper.get("influential_citation_count", 0),
-            "s2_paper_id": paper.get("s2_paper_id", ""),
-            "s2_url": paper.get("s2_url", ""),
-            "doi": paper.get("doi", ""),
-            "pmid": paper.get("pmid", ""),
-        }
-
-        # Time period node (by year)
-        year = paper.get("year")
-        if year:
-            period_key = f"year_{year}"
-            if period_key not in nodes["time_periods"]:
-                nodes["time_periods"][period_key] = {
-                    "id": period_key,
-                    "year": year,
-                    "papers": [],
-                }
-            nodes["time_periods"][period_key]["papers"].append(paper_id)
-
-        # Author nodes and co-authorship hyperedges
-        author_ids = []
-        for author in paper.get("authors_meta", paper.get("authors", [])):
-            author_id = author.get("name", "").lower().replace(" ", "_")
-            if not author_id:
+    # Filter papers by IF and date range
+    filtered_papers = []
+    for p in report.papers:
+        # IF filter: exclude unknown IF when min > 0
+        if p.impact_factor is None:
+            if request.min_impact_factor > 0:
                 continue
+        elif p.impact_factor < request.min_impact_factor:
+            continue
+        # Date filter
+        if request.date_start and p.pub_date < request.date_start:
+            continue
+        if request.date_end and p.pub_date > request.date_end:
+            continue
+        filtered_papers.append(p)
 
-            if author_id not in nodes["authors"]:
-                nodes["authors"][author_id] = {
-                    "id": author_id,
-                    "name": author.get("name", ""),
-                    "affiliation": author.get("affiliation", ""),
-                    "is_first_author_count": 0,
-                    "is_corresponding_author_count": 0,
-                    "papers": [],
-                    "coauthors": set(),
-                    "total_citations": 0,  # sum of citation_count of their papers
+    # Build author nodes and paper hyperedges
+    author_nodes: dict[str, dict] = {}
+    hyperedges: list[dict] = []
+
+    for paper in filtered_papers:
+        paper_id = paper.doi or f"paper_{paper.index}"
+        paper_if = paper.impact_factor or 0.0
+
+        # Determine author set: key_authors (top-2+last-2) or fallback
+        key_authors = getattr(paper, "key_authors", [])
+        if not key_authors:
+            key_authors = [a for a in [paper.first_author, paper.corresponding_author] if a and a != "Unknown"]
+
+        author_ids = []
+        for name in key_authors:
+            aid = name.lower().strip()
+            if not aid:
+                continue
+            if aid not in author_nodes:
+                author_nodes[aid] = {
+                    "id": aid,
+                    "type": "author",
+                    "name": name,
+                    "importance": 0.0,
+                    "paper_count": 0,
+                    "mesh_keywords": [],
                 }
+            author_nodes[aid]["importance"] += paper_if
+            author_nodes[aid]["paper_count"] += 1
+            # Accumulate mesh keywords for clustering
+            for kw in getattr(paper, "mesh_keywords", []):
+                if kw not in author_nodes[aid]["mesh_keywords"]:
+                    author_nodes[aid]["mesh_keywords"].append(kw)
+            author_ids.append(aid)
 
-            nodes["authors"][author_id]["papers"].append(paper_id)
-            nodes["authors"][author_id]["total_citations"] += paper.get("citation_count", 0)
-            if author.get("is_first_author"):
-                nodes["authors"][author_id]["is_first_author_count"] += 1
-            if author.get("is_corresponding_author"):
-                nodes["authors"][author_id]["is_corresponding_author_count"] += 1
+        if not author_ids:
+            continue
 
-            author_ids.append(author_id)
+        hyperedges.append({
+            "id": paper_id,
+            "type": "paper_hyperedge",
+            "author_ids": author_ids,
+            "title": paper.title,
+            "journal": paper.journal,
+            "impact_factor": paper_if,
+            "pub_date": paper.pub_date,
+            "doi": paper.doi,
+            "pmid": paper.pmid,
+            "mesh_keywords": getattr(paper, "mesh_keywords", []),
+        })
 
-            # Institution node
-            affiliation = author.get("affiliation", "")
-            if affiliation:
-                inst_id = affiliation.lower().replace(" ", "_")[:50]
-                if inst_id not in nodes["institutions"]:
-                    nodes["institutions"][inst_id] = {
-                        "id": inst_id,
-                        "name": affiliation,
-                        "authors": set(),
-                        "papers": set(),
-                    }
-                nodes["institutions"][inst_id]["authors"].add(author_id)
-                nodes["institutions"][inst_id]["papers"].add(paper_id)
-
-        # Co-authorship hyperedge
-        if len(author_ids) > 1:
-            hyperedges.append({
-                "type": "coauthorship",
-                "nodes": author_ids,
-                "paper": paper_id,
-                "weight": len(author_ids),
-            })
-
-            # Update coauthor relationships
-            for i, a1 in enumerate(author_ids):
-                for a2 in author_ids[i+1:]:
-                    nodes["authors"][a1]["coauthors"].add(a2)
-                    nodes["authors"][a2]["coauthors"].add(a1)
-
-        # Author-paper hyperedge (authorship)
-        for author_id in author_ids:
-            hyperedges.append({
-                "type": "authorship",
-                "nodes": [author_id, paper_id],
-                "weight": 1,
-            })
-
-        # Temporal hyperedge (paper-time period)
-        if year:
-            hyperedges.append({
-                "type": "temporal",
-                "nodes": [paper_id, period_key],
-                "weight": 1,
-            })
-
-    # ── Citation network: directed edges within the corpus ───────────────────
-    citation_edges: list[dict] = []
-    in_corpus_link_count = 0
-
-    for paper in papers:
-        paper_id = paper.get("pmid") or paper.get("doi") or paper.get("title", "")[:50]
-        for ref in paper.get("references", []):
-            ref_doi = (ref.get("doi") or "").lower().strip()
-            ref_pmid = str(ref.get("pmid") or "").strip()
-            target_id = (
-                corpus_doi_map.get(ref_doi)
-                or corpus_pmid_map.get(ref_pmid)
-            )
-            if target_id and target_id != paper_id:
-                citation_edges.append({
-                    "type": "citation",
-                    "source": paper_id,
-                    "target": target_id,
-                    "weight": 1,
-                })
-                in_corpus_link_count += 1
-
-    # ── Citation statistics ───────────────────────────────────────────────────
-    all_citation_counts = [
-        n["citation_count"] for n in nodes["papers"].values()
-        if n["citation_count"] > 0
-    ]
-    citation_stats = {
-        "total_citations": sum(all_citation_counts),
-        "papers_with_citations": len(all_citation_counts),
-        "max_citations": max(all_citation_counts) if all_citation_counts else 0,
-        "in_corpus_links": in_corpus_link_count,
-        "most_cited": sorted(
-            [
-                {"paper_id": n["id"], "title": n["title"][:60],
-                 "year": n["year"], "citation_count": n["citation_count"]}
-                for n in nodes["papers"].values() if n["citation_count"] > 0
-            ],
-            key=lambda x: x["citation_count"],
-            reverse=True,
-        )[:10],
-    }
-
-    # Convert sets to lists for JSON serialization
-    for author in nodes["authors"].values():
-        author["coauthors"] = list(author["coauthors"])
-    for inst in nodes["institutions"].values():
-        inst["authors"] = list(inst["authors"])
-        inst["papers"] = list(inst["papers"])
+    # Compute statistics
+    dates = [p.pub_date for p in filtered_papers if p.pub_date]
+    ifs = [p.impact_factor for p in filtered_papers if p.impact_factor]
 
     return {
-        "nodes": {k: list(v.values()) if isinstance(v, dict) else v for k, v in nodes.items()},
-        "hyperedges": hyperedges,
-        "citation_edges": citation_edges,
-        "citation_stats": citation_stats,
+        "topic": report.topic,
+        "report_time_range": {
+            "start": report.time_range_start,
+            "end": report.time_range_end,
+        },
+        "nodes": {
+            "authors": list(author_nodes.values()),
+        },
+        "edges": hyperedges,
+        "statistics": {
+            "total_papers": len(hyperedges),
+            "total_authors": len(author_nodes),
+            "filtered_from": len(report.papers),
+            "avg_impact_factor": round(sum(ifs) / len(ifs), 2) if ifs else 0,
+            "date_range": {
+                "start": min(dates) if dates else None,
+                "end": max(dates) if dates else None,
+            },
+        },
     }
-
-
-def _build_hypergraph_analysis_prompt(
-    hypergraph: dict,
-    depth: str,
-    include_collaboration: bool,
-    include_influence: bool,
-    include_milestones: bool,
-) -> str:
-    """Build analysis prompt for LLM based on hypergraph data."""
-
-    stats = {
-        "total_authors": len(hypergraph["nodes"]["authors"]),
-        "total_papers": len(hypergraph["nodes"]["papers"]),
-        "total_institutions": len(hypergraph["nodes"]["institutions"]),
-        "total_hyperedges": len(hypergraph["hyperedges"]),
-    }
-
-    citation_stats = hypergraph.get("citation_stats", {})
-
-    # Top collaborators by coauthor count
-    authors_by_coauthor_count = sorted(
-        hypergraph["nodes"]["authors"],
-        key=lambda a: len(a.get("coauthors", [])),
-        reverse=True,
-    )[:10]
-
-    # Top authors by total citation count of their papers
-    authors_by_citations = sorted(
-        hypergraph["nodes"]["authors"],
-        key=lambda a: a.get("total_citations", 0),
-        reverse=True,
-    )[:10]
-
-    # Get papers by year for timeline
-    papers_by_year = {}
-    for paper in hypergraph["nodes"]["papers"]:
-        year = paper.get("year", 0)
-        if year:
-            papers_by_year[year] = papers_by_year.get(year, 0) + 1
-
-    prompt = f"""Analyze this research hypergraph data:
-
-## Statistics
-- Total Authors: {stats['total_authors']}
-- Total Papers: {stats['total_papers']}
-- Total Institutions: {stats['total_institutions']}
-- Total Relationships: {stats['total_hyperedges']}
-- Total Citations (S2): {citation_stats.get('total_citations', 'N/A')}
-- Within-corpus Citation Links: {citation_stats.get('in_corpus_links', 0)}
-
-## Top Collaborators (by number of coauthors)
-"""
-    for author in authors_by_coauthor_count:
-        prompt += f"- {author['name']}: {len(author.get('coauthors', []))} coauthors, {len(author.get('papers', []))} papers"
-        if author.get('is_first_author_count', 0) > 0:
-            prompt += f", first author on {author['is_first_author_count']} papers"
-        if author.get('is_corresponding_author_count', 0) > 0:
-            prompt += f", corresponding author on {author['is_corresponding_author_count']} papers"
-        prompt += "\n"
-
-    if citation_stats.get("total_citations", 0) > 0:
-        prompt += "\n## Most Cited Papers in Corpus\n"
-        for item in citation_stats.get("most_cited", [])[:8]:
-            prompt += f"- [{item['year']}] {item['title']} — {item['citation_count']} citations\n"
-
-        prompt += "\n## Top Authors by Total Citations\n"
-        for author in authors_by_citations:
-            tc = author.get("total_citations", 0)
-            if tc > 0:
-                prompt += (
-                    f"- {author['name']}: {tc} total citations across "
-                    f"{len(author.get('papers', []))} papers\n"
-                )
-
-    prompt += f"\n## Papers by Year\n"
-    for year in sorted(papers_by_year.keys()):
-        prompt += f"- {year}: {papers_by_year[year]} papers\n"
-
-    prompt += f"\n## Analysis Depth: {depth}\n"
-    prompt += f"Include Collaboration Networks: {include_collaboration}\n"
-    prompt += f"Include Influence Analysis: {include_influence}\n"
-    prompt += f"Include Milestones: {include_milestones}\n"
-
-    prompt += """
-Please provide a comprehensive analysis of this research landscape, identifying:
-1. Key opinion leaders and their influence
-2. Research collaboration clusters/communities
-3. Important milestones and breakthroughs over time
-4. Areas of academic debate or competing approaches
-5. Areas of strong consensus
-6. Evolution patterns in the field
-
-Return your analysis in the specified JSON format.
-"""
-
-    return prompt

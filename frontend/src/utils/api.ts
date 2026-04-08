@@ -6,7 +6,8 @@ import type {
   Stats,
   ResearchJob,
   CompletedResearch,
-  HypergraphTimelineResponse,
+  ReportInfo,
+  ReportHypergraphResponse,
 } from '../types';
 
 const api = axios.create({
@@ -75,8 +76,8 @@ export async function importResearchToKB(jobId: string): Promise<{ job_id: strin
   return data;
 }
 
-export async function deleteResearchJob(jobId: string): Promise<{ job_id: string; deleted: boolean }> {
-  const { data } = await api.delete(`/research/jobs/${jobId}`);
+export async function deleteResearchJob(jobId: string, force: boolean = false): Promise<{ job_id: string; deleted: boolean }> {
+  const { data } = await api.delete(`/research/jobs/${jobId}`, { params: { force } });
   return data;
 }
 
@@ -89,21 +90,24 @@ export async function getCompletedResearch(): Promise<CompletedResearch[]> {
   return data;
 }
 
-// === Hypergraph Timeline (NEW) ===
+// === Hypergraph Timeline (Report-based) ===
 
-export async function getHypergraphTimeline(
-  jobId: string,
-  analysisDepth: string = 'full',
-  includeCollaboration: boolean = true,
-  includeInfluence: boolean = true,
-  includeMilestones: boolean = true,
-): Promise<HypergraphTimelineResponse> {
-  const { data } = await api.post('/knowledge/hypergraph-timeline', {
-    job_id: jobId,
-    analysis_depth: analysisDepth,
-    include_collaboration: includeCollaboration,
-    include_influence: includeInfluence,
-    include_milestones: includeMilestones,
+export async function getAvailableReports(): Promise<ReportInfo[]> {
+  const { data } = await api.get('/knowledge/reports');
+  return data;
+}
+
+export async function getHypergraphFromReport(
+  filePath: string,
+  minImpactFactor: number = 2.0,
+  dateStart?: string,
+  dateEnd?: string,
+): Promise<ReportHypergraphResponse> {
+  const { data } = await api.post('/knowledge/hypergraph-from-report', {
+    file_path: filePath,
+    min_impact_factor: minImpactFactor,
+    date_start: dateStart || null,
+    date_end: dateEnd || null,
   });
   return data;
 }

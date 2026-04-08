@@ -77,6 +77,7 @@ class LiteratureResearchService:
 
     def __init__(self):
         self.jobs: dict[str, ResearchJob] = {}
+        self._running_tasks: dict[str, "asyncio.Task"] = {}
         self._load_existing_jobs()
 
     def _load_existing_jobs(self):
@@ -254,46 +255,10 @@ class LiteratureResearchService:
             # STAGE 2: Semantic Scholar Enrichment (with checkpoint resume)
             # ═══════════════════════════════════════════════════════════════════
             if not job.stage_completed.get("enriching"):
-                job.current_stage = "enriching"
-                self._save_job(job)
-
-                logger.info(f"[Stage 2/4] Semantic Scholar enrichment for job {job_id}")
-
-                def _run_s2_enrichment():
-                    try:
-                        for _mod in ("enrich_semantic_scholar",):
-                            sys.modules.pop(_mod, None)
-                        from enrich_semantic_scholar import enrich_papers_with_semantic_scholar
-
-                        network_limit = getattr(settings, "semantic_scholar_network_limit", 100)
-                        enrich_papers_with_semantic_scholar(
-                            job.papers,
-                            api_key=getattr(settings, "semantic_scholar_api_key", ""),
-                            fetch_network=True,
-                            network_limit=network_limit,
-                        )
-                        # Review: check S2 match failures
-                        missing = [p.get("title", "")[:60] for p in job.papers
-                                   if not p.get("s2_paper_id")]
-                        if missing:
-                            msg = f"Semantic Scholar 未匹配 {len(missing)}/{len(job.papers)} 篇（引用数据缺失）"
-                            logger.warning(f"[S2] {msg}: {missing[:3]}")
-                            job.warnings.append(msg)
-                        logger.info(f"S2 enrichment completed for job {job_id}")
-                    except Exception as s2_err:
-                        msg = f"Semantic Scholar 富化失败（引用数据不可用）: {s2_err}"
-                        logger.warning(f"S2 enrichment failed (non-fatal): {s2_err}")
-                        job.warnings.append(msg)
-
-                await asyncio.to_thread(_run_s2_enrichment)
-
-                # Save after enrichment
+                logger.info("[Stage 2/4] Semantic Scholar enrichment skipped (removed)")
                 job.stage_completed["enriching"] = True
                 job.last_successful_stage = "enriching"
                 self._save_job(job)
-                logger.info(f"[Stage 2/4] Semantic Scholar enrichment completed")
-            else:
-                logger.info(f"[Stage 2/4] Semantic Scholar enrichment skipped (already completed)")
 
             # ═══════════════════════════════════════════════════════════════════
             # STAGE 3: LLM Analysis (with per-paper checkpoint resume)
@@ -313,14 +278,14 @@ class LiteratureResearchService:
                         for _mod in ("utils", "analyze_content"):
                             sys.modules.pop(_mod, None)
 
-                        from utils import translate_text
-                        from analyze_content import analyze_paper_content, validate_analysis_complete, _SDK_OK as _llm_ok
-                        logger.info(f"LLM analysis modules loaded (SDK mode: {_llm_ok})")
+                        from utils import translate_text, _call_llm as _test_llm_call
+                        from analyze_content import analyze_paper_content, validate_analysis_complete
+                        # Test LLM reachability (works via claude CLI even if SDK is blocked)
+                        _llm_ok = bool(_test_llm_call("You are helpful.", "Reply OK", max_tokens=5))
+                        logger.info(f"LLM analysis modules loaded (reachable: {_llm_ok})")
 
                         if not _llm_ok:
-                            msg = "LLM SDK 不可用（API Key 未配置或认证失败），翻译和深度分析已跳过。"
-                            if not settings.anthropic_api_key:
-                                msg += " 请在 .env 文件中设置 ANTHROPIC_API_KEY。"
+                            msg = "LLM 不可用（claude CLI 无法连接），翻译和深度分析已跳过。"
                             logger.warning(msg)
                             job.warnings.append(msg)
                             return
@@ -478,7 +443,9 @@ class LiteratureResearchService:
                     logger.warning(f"Enriched Markdown generation failed (non-fatal): {report_err}")
 
                 # Auto-conversion: Word / HTML / HTML-PPT / PDF-PPT
-                if md_path and md_path.exists():
+                # Skip HTML/PDF generation when total papers > 100 to avoid
+                # excessive resource usage; only Markdown report is produced.
+                if md_path and md_path.exists() and job.total_papers <= 100:
                     try:
                         import subprocess
                         md_to_reports_script = scripts_path / "md_to_reports.py"
@@ -513,6 +480,11 @@ class LiteratureResearchService:
                         logger.info(f"Pre-built ZIP ready for job {job_id}")
                     except Exception as zip_err:
                         logger.warning(f"Pre-built ZIP failed (non-fatal): {zip_err}")
+                elif md_path and md_path.exists() and job.total_papers > 100:
+                    logger.info(
+                        f"Skipping HTML/PDF conversion for job {job_id}: "
+                        f"total_papers={job.total_papers} exceeds 100-paper limit"
+                    )
 
                 # Mark stage complete
                 job.stage_completed["converting"] = True
@@ -675,8 +647,10 @@ class LiteratureResearchService:
         self._save_job(job)
         return job
 
-    def delete_job(self, job_id: str) -> bool:
+    def delete_job(self, job_id: str, force: bool = False) -> bool:
         """Delete a job, its metadata file, and its result folder on disk.
+
+        If *force* is True, a running job will be cancelled first.
 
         On Windows, generated PDF files may still be locked by the Puppeteer/Node.js
         subprocess for a brief period after generation completes.  We use an onerror
@@ -688,7 +662,16 @@ class LiteratureResearchService:
         if not job:
             return False
         if job.status == "running":
-            raise ValueError(f"Cannot delete running job {job_id}")
+            if not force:
+                raise ValueError(f"Cannot delete running job {job_id}")
+            # Cancel the asyncio task if tracked
+            task = self._running_tasks.pop(job_id, None)
+            if task and not task.done():
+                task.cancel()
+                logger.info(f"Cancelled running task for job {job_id}")
+            job.status = "failed"
+            job.error_message = "Forcefully stopped by user"
+            self._save_job(job)
         # Delete result folder if present
         if job.result_path:
             result_dir = Path(job.result_path).parent

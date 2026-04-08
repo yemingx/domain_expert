@@ -37,13 +37,34 @@ def _load_model_from_settings() -> str:
     return default_model
 
 
+# Load env vars from ~/.claude/settings.json (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, etc.)
+def _load_settings_env():
+    p = Path.home() / ".claude" / "settings.json"
+    if p.exists():
+        try:
+            data = json.load(open(p, encoding='utf-8'))
+            for k, v in data.get("env", {}).items():
+                if k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+_load_settings_env()
+
 # Support ANTHROPIC_AUTH_TOKEN as fallback for ANTHROPIC_API_KEY
 if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
     os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
 
 try:
     import anthropic as _anthropic
-    _client = _anthropic.Anthropic()  # 自动从 keychain/env 读取认证
+    _kwargs: dict = {}
+    if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        _kwargs["auth_token"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        _kwargs["api_key"] = os.environ["ANTHROPIC_API_KEY"]
+    if os.environ.get("ANTHROPIC_BASE_URL"):
+        _kwargs["base_url"] = os.environ["ANTHROPIC_BASE_URL"]
+    _client = _anthropic.Anthropic(**_kwargs)
     _SDK_OK = True
 except Exception as _e:
     print(f"[WARNING] Anthropic SDK 初始化失败: {_e}")
@@ -61,6 +82,7 @@ print(f"[OK] LLM 模型配置: translate={_TRANSLATE_MODEL}, analyze={_ANALYZE_M
 
 
 import time as _time
+import subprocess as _subprocess
 
 _LLM_MAX_RETRIES = 3
 _LLM_RETRY_BACKOFF = (5, 10, 20)  # 秒
@@ -68,41 +90,31 @@ _LLM_RETRY_BACKOFF = (5, 10, 20)  # 秒
 
 def _call_llm(system_prompt: str, user_prompt: str,
               model: str = _ANALYZE_MODEL, max_tokens: int = 2000) -> str:
-    """调用 Anthropic SDK，带指数退避重试（最多 3 次）。失败返回空字符串。"""
-    if not _SDK_OK or _client is None:
-        print("[WARNING] SDK 不可用，跳过 LLM 调用")
-        return ""
-    last_err = ""
+    """通过 claude CLI 调用 LLM（代理只允许 Claude Code CLI），带重试。"""
+    prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
     for attempt in range(_LLM_MAX_RETRIES):
         try:
-            msg = _client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+            import platform as _platform
+            _claude_cmd = "claude.cmd" if _platform.system() == "Windows" else "claude"
+            proc = _subprocess.run(
+                [_claude_cmd, "--print"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
             )
-            # 处理不同类型的 content blocks (TextBlock, ThinkingBlock, etc.)
-            for block in msg.content:
-                if hasattr(block, 'text') and block.text:
-                    return block.text.strip()
-                elif hasattr(block, 'thinking') and block.thinking:
-                    # ThinkingBlock - 跳过，继续找 TextBlock
-                    continue
-            # 如果没有找到 text 属性，返回空字符串
-            print(f"[WARNING] LLM 响应中没有找到文本内容: {msg.content}")
-            return ""
+            result = proc.stdout.strip()
+            if result:
+                return result
+            if proc.stderr:
+                print(f"[WARNING] claude CLI stderr: {proc.stderr[:200]}")
         except Exception as e:
-            last_err = str(e)
-            err_lower = last_err.lower()
-            if "authentication" in err_lower or "invalid x-api-key" in err_lower:
-                print(f"[WARNING] LLM 认证失败，不重试: {e}")
-                return ""
-            if attempt == _LLM_MAX_RETRIES - 1:
-                break
-            wait = _LLM_RETRY_BACKOFF[attempt]
-            print(f"[WARNING] LLM 调用失败 ({attempt+1}/{_LLM_MAX_RETRIES})，{wait}s 后重试: {e}")
-            _time.sleep(wait)
-    print(f"[WARNING] LLM 调用最终失败（已重试 {_LLM_MAX_RETRIES} 次）: {last_err}")
+            print(f"[WARNING] LLM 调用失败 ({attempt+1}/{_LLM_MAX_RETRIES}): {e}")
+        if attempt < _LLM_MAX_RETRIES - 1:
+            _time.sleep(_LLM_RETRY_BACKOFF[attempt])
+    print(f"[WARNING] LLM 调用最终失败（已重试 {_LLM_MAX_RETRIES} 次）")
     return ""
 
 
@@ -182,25 +194,88 @@ def translate_text(text, type="title"):
     return translated
 
 
+# LLM 期刊匹配缓存
+_journal_llm_cache: dict[str, str] = {}
+
+
+def _llm_match_journal_util(journal_name: str) -> str:
+    """当精确/大小写匹配均失败时，用 LLM 从 IF 数据库中识别正确期刊。"""
+    cache_key = journal_name.strip().lower()
+    if cache_key in _journal_llm_cache:
+        return _journal_llm_cache[cache_key]
+
+    query_words = {w for w in cache_key.split() if len(w) > 2}
+    if not query_words:
+        _journal_llm_cache[cache_key] = "暂无数据"
+        return "暂无数据"
+
+    candidates: dict[str, str] = {}
+    for k, v in JOURNAL_IF.items():
+        k_words = {w for w in k.lower().split() if len(w) > 2}
+        if query_words & k_words:
+            candidates[k] = v
+
+    if not candidates:
+        _journal_llm_cache[cache_key] = "暂无数据"
+        return "暂无数据"
+
+    if len(candidates) > 50:
+        refined = {}
+        for k, v in candidates.items():
+            k_words = {w for w in k.lower().split() if len(w) > 2}
+            if len(query_words & k_words) >= 2:
+                refined[k] = v
+        if refined:
+            candidates = refined
+
+    candidate_list = "\n".join(
+        f"- {k}" for k in list(candidates.keys())[:50]
+    )
+
+    system_prompt = "你是学术期刊名称匹配专家。"
+    user_prompt = (
+        f"请判断期刊「{journal_name}」对应候选列表中的哪本期刊。\n\n"
+        f"候选期刊：\n{candidate_list}\n\n"
+        "要求：\n"
+        "- 如果找到匹配，只输出候选列表中对应的完整期刊名称（必须与列表中的完全一致）\n"
+        '- 如果没有匹配，只输出「无」\n'
+        "- 不要输出任何解释"
+    )
+
+    result = _call_llm(system_prompt, user_prompt, max_tokens=200)
+
+    if result:
+        matched = result.strip().strip("\"'")
+        if matched and matched != "无":
+            if matched in JOURNAL_IF:
+                _journal_llm_cache[cache_key] = JOURNAL_IF[matched]
+                return _journal_llm_cache[cache_key]
+            for k, v in JOURNAL_IF.items():
+                if k.lower() == matched.lower():
+                    _journal_llm_cache[cache_key] = v
+                    return _journal_llm_cache[cache_key]
+
+    _journal_llm_cache[cache_key] = "暂无数据"
+    return "暂无数据"
+
+
 def get_journal_if(journal_name):
-    """获取期刊影响因子（基于2024JCR数据）。"""
+    """获取期刊影响因子（基于2024JCR数据）：精确 → 大小写 → LLM 三级匹配。"""
     if not journal_name:
         return "暂无数据"
 
     journal_clean = journal_name.strip()
     journal_lower = journal_clean.lower()
 
+    # Level 1: 精确匹配
     if journal_clean in JOURNAL_IF:
         return JOURNAL_IF[journal_clean]
+    # Level 2: 大小写不敏感
     for journal, if_value in JOURNAL_IF.items():
         if journal.lower() == journal_lower:
             return if_value
-    for journal, if_value in JOURNAL_IF.items():
-        jl = journal.lower()
-        if jl in journal_lower or journal_lower in jl:
-            if len(jl) > 5 and len(journal_lower) > 5:
-                return if_value
-    return "暂无数据"
+    # Level 3: LLM 智能匹配（替代原有的子串模糊匹配）
+    return _llm_match_journal_util(journal_clean)
 
 
 def identify_research_team(authors, affiliation_text=""):

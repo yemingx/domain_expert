@@ -107,78 +107,56 @@ export interface CompletedResearch {
   completed_at?: string;
 }
 
-// Hypergraph types
-export interface HypergraphNode {
-  id: string;
-  name?: string;
-  type: 'author' | 'paper' | 'institution' | 'time_period' | 'concept';
-  [key: string]: any;
-}
-
-export interface HypergraphEdge {
-  type: string;
-  nodes: string[];
-  weight: number;
-  paper?: string;
-}
-
-export interface HypergraphData {
-  nodes: {
-    authors: HypergraphNode[];
-    papers: HypergraphNode[];
-    institutions: HypergraphNode[];
-    time_periods: HypergraphNode[];
-    concepts: HypergraphNode[];
-  };
-  hyperedges: HypergraphEdge[];
-}
-
-export interface KeyFigure {
-  name: string;
-  role: string;
-  influence_score: number;
-  institution: string;
-}
-
-export interface CollaborationCluster {
-  id: string;
-  members: string[];
-  institution: string;
+// Hypergraph types (report-based)
+export interface ReportInfo {
+  topic: string;
+  time_range_start: string;
+  time_range_end: string;
   paper_count: number;
+  file_path: string;
+  dir_name: string;
 }
 
-export interface Milestone {
-  year: number;
-  event: string;
-  significance: string;
-  key_papers: string[];
+export interface ReportAuthorNode {
+  id: string;
+  type: 'author';
+  name: string;
+  importance: number;
+  paper_count: number;
+  mesh_keywords: string[];
 }
 
-export interface Debate {
+export interface ReportPaperHyperedge {
+  id: string;
+  type: 'paper_hyperedge';
+  author_ids: string[];
+  title: string;
+  journal: string;
+  impact_factor: number;
+  pub_date: string;
+  doi: string;
+  pmid: string;
+  mesh_keywords: string[];
+}
+
+export interface ReportHypergraphResponse {
   topic: string;
-  sides: string[];
-  status: 'ongoing' | 'resolved';
-}
-
-export interface HypergraphAnalysis {
-  summary: string;
-  key_figures: KeyFigure[];
-  collaboration_clusters: CollaborationCluster[];
-  milestones: Milestone[];
-  debates: Debate[];
-  consensus_areas: string[];
-  temporal_patterns: string;
-}
-
-export interface HypergraphTimelineResponse {
-  job_id: string;
-  topic: string;
-  hypergraph: HypergraphData;
-  analysis: HypergraphAnalysis;
+  report_time_range: {
+    start: string;
+    end: string;
+  };
+  nodes: {
+    authors: ReportAuthorNode[];
+  };
+  edges: ReportPaperHyperedge[];
   statistics: {
     total_papers: number;
     total_authors: number;
-    total_institutions: number;
-    time_range: { start: number; end: number };
+    filtered_from: number;
+    avg_impact_factor: number;
+    date_range: {
+      start: string | null;
+      end: string | null;
+    };
   };
 }

@@ -62,22 +62,101 @@ def _load_journal_if() -> dict:
     return {}
 
 
+# LLM 期刊匹配缓存（进程级），避免重复调用
+_journal_llm_cache: dict[str, str] = {}
+
+
+def _llm_match_journal(journal_name: str, if_data: dict) -> str:
+    """当精确/大小写匹配均失败时，用 LLM 从 IF 数据库中识别正确期刊。"""
+    cache_key = journal_name.strip().lower()
+    if cache_key in _journal_llm_cache:
+        return _journal_llm_cache[cache_key]
+
+    # ── 预筛选候选期刊（按词重叠过滤，避免把 1w+ 条目全送给 LLM） ──
+    query_words = {w for w in cache_key.split() if len(w) > 2}
+    if not query_words:
+        _journal_llm_cache[cache_key] = "暂无数据"
+        return "暂无数据"
+
+    candidates: dict[str, str] = {}
+    for k, v in if_data.items():
+        k_words = {w for w in k.lower().split() if len(w) > 2}
+        if query_words & k_words:
+            candidates[k] = v
+
+    if not candidates:
+        _journal_llm_cache[cache_key] = "暂无数据"
+        return "暂无数据"
+
+    # 候选太多时，要求至少 2 个词重叠
+    if len(candidates) > 50:
+        refined = {}
+        for k, v in candidates.items():
+            k_words = {w for w in k.lower().split() if len(w) > 2}
+            if len(query_words & k_words) >= 2:
+                refined[k] = v
+        if refined:
+            candidates = refined
+
+    candidate_list = "\n".join(
+        f"- {k}" for k in list(candidates.keys())[:50]
+    )
+
+    try:
+        from utils import _call_llm
+    except ImportError:
+        _journal_llm_cache[cache_key] = "暂无数据"
+        return "暂无数据"
+
+    system_prompt = "你是学术期刊名称匹配专家。"
+    user_prompt = (
+        f"请判断期刊「{journal_name}」对应候选列表中的哪本期刊。\n\n"
+        f"候选期刊：\n{candidate_list}\n\n"
+        "要求：\n"
+        "- 如果找到匹配，只输出候选列表中对应的完整期刊名称（必须与列表中的完全一致）\n"
+        '- 如果没有匹配，只输出「无」\n'
+        "- 不要输出任何解释"
+    )
+
+    result = _call_llm(system_prompt, user_prompt, max_tokens=200)
+
+    if result:
+        matched = result.strip().strip("\"'")
+        if matched and matched != "无":
+            # 精确验证
+            if matched in if_data:
+                _journal_llm_cache[cache_key] = str(if_data[matched])
+                logger.info("LLM 匹配期刊: '%s' → '%s' (IF=%s)",
+                            journal_name, matched, if_data[matched])
+                return _journal_llm_cache[cache_key]
+            # 大小写容错验证
+            for k, v in if_data.items():
+                if k.lower() == matched.lower():
+                    _journal_llm_cache[cache_key] = str(v)
+                    logger.info("LLM 匹配期刊: '%s' → '%s' (IF=%s)",
+                                journal_name, k, v)
+                    return _journal_llm_cache[cache_key]
+
+    logger.info("LLM 未匹配到期刊: '%s'", journal_name)
+    _journal_llm_cache[cache_key] = "暂无数据"
+    return "暂无数据"
+
+
 def _get_journal_if(journal_name: str, if_data: dict) -> str:
-    """查询期刊影响因子，支持精确/大小写/模糊三级匹配。"""
+    """查询期刊影响因子：精确 → 大小写 → LLM 三级匹配。"""
     if not journal_name:
         return "暂无数据"
     jl = journal_name.strip()
     jll = jl.lower()
+    # Level 1: 精确匹配
     if jl in if_data:
         return str(if_data[jl])
+    # Level 2: 大小写不敏感
     for k, v in if_data.items():
         if k.lower() == jll:
             return str(v)
-    for k, v in if_data.items():
-        kl = k.lower()
-        if (kl in jll or jll in kl) and len(kl) > 5 and len(jll) > 5:
-            return str(v)
-    return "暂无数据"
+    # Level 3: LLM 智能匹配（替代原有的子串模糊匹配）
+    return _llm_match_journal(jl, if_data)
 
 
 def _is_abstract_complete(abstract: str) -> tuple[bool, str]:
@@ -293,6 +372,10 @@ def _parse_article(article: ET.Element, if_data: dict) -> Optional[dict]:
     if not corresp_authors and len(authors_meta) > 1:
         corresp_authors = [authors_meta[-1]["name"]]
 
+    n = len(authors_meta)
+    key_idx = sorted(set([0, min(1, n - 1), max(0, n - 2), n - 1])) if n > 0 else []
+    key_authors = [authors_meta[i]["name"] for i in key_idx]
+
     if not authors_meta:
         author_display = "Unknown"
     elif len(authors_meta) == 1:
@@ -305,6 +388,12 @@ def _parse_article(article: ET.Element, if_data: dict) -> Optional[dict]:
         author_display = f"{first_author} et al."
 
     affiliations = list({a["affiliation"] for a in authors_meta if a["affiliation"]})
+
+    mesh_terms = []
+    for mh in article.findall(".//MeshHeading"):
+        desc = mh.find("DescriptorName")
+        if desc is not None and desc.get("MajorTopicYN") == "Y":
+            mesh_terms.append(desc.text)
 
     return {
         "pmid": pmid,
@@ -322,6 +411,8 @@ def _parse_article(article: ET.Element, if_data: dict) -> Optional[dict]:
         "author_display": author_display,
         "first_author": first_author,
         "corresponding_authors": corresp_authors,
+        "key_authors": key_authors,
+        "mesh_keywords": mesh_terms,
         "research_team": affiliations[0][:120] if affiliations else "",
         "affiliations": affiliations,
         # 分析字段（由 analyze_content 填充）

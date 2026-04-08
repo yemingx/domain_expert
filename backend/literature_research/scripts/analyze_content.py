@@ -37,13 +37,36 @@ def _load_model_from_settings() -> str:
     return default_model
 
 
+# Load env vars from ~/.claude/settings.json (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, etc.)
+def _load_settings_env():
+    from pathlib import Path
+    p = Path.home() / ".claude" / "settings.json"
+    if p.exists():
+        try:
+            import json as _json
+            data = _json.load(open(p, encoding='utf-8'))
+            for k, v in data.get("env", {}).items():
+                if k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+_load_settings_env()
+
 # Support ANTHROPIC_AUTH_TOKEN as fallback for ANTHROPIC_API_KEY
 if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
     os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
 
 try:
     import anthropic as _anthropic
-    _client = _anthropic.Anthropic()
+    _kwargs: dict = {}
+    if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        _kwargs["auth_token"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        _kwargs["api_key"] = os.environ["ANTHROPIC_API_KEY"]
+    if os.environ.get("ANTHROPIC_BASE_URL"):
+        _kwargs["base_url"] = os.environ["ANTHROPIC_BASE_URL"]
+    _client = _anthropic.Anthropic(**_kwargs)
     _SDK_OK = True
 except Exception as _e:
     print(f"[WARNING] Anthropic SDK 初始化失败: {_e}")
@@ -56,48 +79,38 @@ print(f"[analyze_content] 分析模型: {_ANALYZE_MODEL}")
 
 
 import time as _time
+import subprocess as _subprocess
 
 _LLM_MAX_RETRIES = 3
 _LLM_RETRY_BACKOFF = (5, 10, 20)  # 秒
 
 
 def _call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
-    """调用 Anthropic SDK 进行分析，带指数退避重试（最多 3 次）。"""
-    if not _SDK_OK or _client is None:
-        print("[WARNING] SDK 不可用，跳过分析")
-        return ""
-    last_err = ""
+    """通过 claude CLI 调用 LLM（代理只允许 Claude Code CLI），带重试。"""
+    prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
     for attempt in range(_LLM_MAX_RETRIES):
         try:
-            msg = _client.messages.create(
-                model=_ANALYZE_MODEL,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+            import platform as _platform
+            _claude_cmd = "claude.cmd" if _platform.system() == "Windows" else "claude"
+            proc = _subprocess.run(
+                [_claude_cmd, "--print"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
             )
-            # 处理不同类型的 content blocks (TextBlock, ThinkingBlock, etc.)
-            for block in msg.content:
-                if hasattr(block, 'text') and block.text:
-                    return block.text.strip()
-                elif hasattr(block, 'thinking') and block.thinking:
-                    # ThinkingBlock - 跳过，继续找 TextBlock
-                    continue
-            # 如果没有找到 text 属性，返回空字符串
-            print(f"[WARNING] LLM 响应中没有找到文本内容")
-            return ""
+            result = proc.stdout.strip()
+            if result:
+                return result
+            if proc.stderr:
+                print(f"[WARNING] claude CLI stderr: {proc.stderr[:200]}")
         except Exception as e:
-            last_err = str(e)
-            err_lower = last_err.lower()
-            # 认证失败不重试
-            if "authentication" in err_lower or "invalid x-api-key" in err_lower:
-                print(f"[WARNING] LLM 认证失败，不重试: {e}")
-                return ""
-            if attempt == _LLM_MAX_RETRIES - 1:
-                break
-            wait = _LLM_RETRY_BACKOFF[attempt]
-            print(f"[WARNING] LLM 分析调用失败 ({attempt+1}/{_LLM_MAX_RETRIES})，{wait}s 后重试: {e}")
-            _time.sleep(wait)
-    print(f"[WARNING] LLM 分析调用最终失败（已重试 {_LLM_MAX_RETRIES} 次）: {last_err}")
+            print(f"[WARNING] LLM 调用失败 ({attempt+1}/{_LLM_MAX_RETRIES}): {e}")
+        if attempt < _LLM_MAX_RETRIES - 1:
+            _time.sleep(_LLM_RETRY_BACKOFF[attempt])
+    print(f"[WARNING] LLM 调用最终失败（已重试 {_LLM_MAX_RETRIES} 次）")
     return ""
 
 

@@ -104,7 +104,7 @@ export default function LiteratureResearch() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: deleteResearchJob,
+    mutationFn: ({ jobId, force }: { jobId: string; force?: boolean }) => deleteResearchJob(jobId, force),
     onSuccess: (data) => {
       message.success('Job deleted');
       queryClient.invalidateQueries({ queryKey: ['research-jobs'] });
@@ -272,10 +272,17 @@ export default function LiteratureResearch() {
               Download
             </Button>
           )}
-          {record.status !== 'running' && (
+          {record.status === 'running' ? (
+            <Popconfirm title="Force stop and delete this job?"
+              description="This will cancel the running task and permanently remove the job."
+              onConfirm={() => deleteMutation.mutate({ jobId: record.job_id, force: true })}
+              okText="Force Delete" cancelText="Cancel" okButtonProps={{ danger: true }}>
+              <Button size="small" danger icon={<DeleteOutlined />}>Force Delete</Button>
+            </Popconfirm>
+          ) : (
             <Popconfirm title="Delete this job?"
               description="This will permanently remove the job and its data."
-              onConfirm={() => deleteMutation.mutate(record.job_id)}
+              onConfirm={() => deleteMutation.mutate({ jobId: record.job_id })}
               okText="Delete" cancelText="Cancel" okButtonProps={{ danger: true }}>
               <Button size="small" danger icon={<DeleteOutlined />}>Delete</Button>
             </Popconfirm>

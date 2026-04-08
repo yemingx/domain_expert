@@ -115,6 +115,12 @@ def generate_markdown_report(
             ]
         if pmid:
             lines.append(f"- **PubMed**: [https://pubmed.ncbi.nlm.nih.gov/{pmid}/](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
+        key_authors = p.get("key_authors") or []
+        if key_authors:
+            lines.append(f"- **核心作者**: {'; '.join(key_authors)}")
+        mesh = p.get("mesh_keywords") or []
+        if mesh:
+            lines.append(f"- **MeSH关键词**: {'; '.join(mesh)}")
         lines.append("")
 
         # 摘要 — 始终写入两个 section，缺失时用占位符

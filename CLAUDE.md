@@ -181,3 +181,30 @@ Base: `/api/v1`
 - Celery workers handle async PDF processing; worker must be running for PDF uploads to complete
 - Domain PDFs go in `domain_pdf/` folder; run `scripts/process_pdfs.py` to index them
 - ChromaDB runs as separate container on port 8001 (docker) or use `chromadb` package directly (manual)
+
+## Literature Research Module — Feature Notes
+
+### MeSH Keywords
+Extracted from PubMed XML `MeshHeading/DescriptorName[@MajorTopicYN="Y"]` in `fetch_papers.py:_parse_article()`. Stored as `mesh_keywords: list[str]` on each paper dict and written to the markdown report as `**MeSH关键词**: term1; term2`.
+
+### Key Authors (top-2 + last-2)
+`key_authors` = indices `{0, 1, n-2, n-1}` (deduplicated) from the full author list. Replaces the old first-author-only approach. Written to markdown as `**核心作者**: name1; name2`.
+
+### Semantic Scholar Enrichment
+Stage 2 has been removed. The stage is now a no-op that immediately marks `enriching=True` and moves on.
+
+### Hypergraph Visualization Model
+- **Nodes**: authors (built from `key_authors`; fallback to first + corresponding author)
+- **Hyperedges**: papers rendered as convex hull areas enclosing their author nodes
+- **Hull color**: `d3.interpolateYlOrRd(IF / maxIF)` — higher IF = deeper orange/red
+- **Hull opacity**: fill 0.25, stroke 0.6; dims to 0.08 on hover of unrelated authors
+
+### Keyword Clustering Force
+A custom D3 force (`kw-cluster`) attracts author pairs that share MeSH keywords. Strength = `0.015 × shared_count × alpha`. Authors in the same research domain cluster together visually.
+
+### Time Window Slider
+Default window = 24 months. An Ant Design `Slider` lets users drag the window start across the full report date range. Only papers whose `pub_date` falls within `[windowStart, windowEnd]` are rendered as hyperedges; author nodes are filtered to those appearing in visible edges.
+
+### Author Click → Paper List
+Clicking an author node opens a detail panel listing **all** their papers (from the full unfiltered edge set), sorted by IF descending. Each entry shows title (linked to DOI), date, IF, and journal.
+
