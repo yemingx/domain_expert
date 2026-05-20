@@ -164,8 +164,48 @@ def _fetch_complete_abstract(article: ET.Element, doi: Optional[str]) -> tuple[s
                 return abstract, sources_tried
             logger.warning("浏览器抓取摘要不完整 (%s)", reason)
 
-    # 如果所有来源都失败，返回 PubMed XML 的原始结果（即使不完整）
-    return _get_from_pubmed_xml(), sources_tried
+    # 4. 尝试 PubMed 网页抓取（用 PMID）
+    pmid_elem = article.find(".//PMID")
+    pmid = pmid_elem.text if pmid_elem is not None else None
+    if pmid:
+        abstract = _get_abstract_from_pubmed_web(pmid)
+        if abstract:
+            sources_tried.append("PubMed Web")
+            is_complete, reason = _is_abstract_complete(abstract)
+            if is_complete:
+                return abstract, sources_tried
+            logger.warning("PubMed 网页摘要不完整 (%s)", reason)
+
+    # 如果所有来源都失败，返回最长的非空结果
+    candidates = [c for c in [
+        _get_from_pubmed_xml(),
+        _get_abstract_from_pubmed_web(pmid) if pmid else "",
+    ] if c]
+    return max(candidates, key=len) if candidates else "", sources_tried
+
+
+def _get_abstract_from_pubmed_web(pmid: str) -> Optional[str]:
+    """通过抓取 PubMed 网页获取摘要（第三层回退）。"""
+    if not pmid:
+        return None
+    try:
+        resp = requests.get(
+            f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        # 优先从 meta description 提取（最可靠）
+        m = re.search(r'<meta name="description" content="([^"]*)"', resp.text)
+        if not m:
+            m = re.search(r"<meta name='description' content='([^']*)'", resp.text)
+        if m:
+            import html as _html
+            text = re.sub(r"<[^>]+>", " ", _html.unescape(m.group(1))).strip()
+            text = re.sub(r"\s+", " ", text)
+            return text if text else None
+    except Exception as e:
+        logger.warning("PubMed 网页抓取失败 (PMID %s): %s", pmid, e)
+    return None
 
 
 def _get_abstract_from_europepmc(doi: str) -> Optional[str]:
@@ -224,11 +264,15 @@ def _get_abstract_from_browser(doi: str) -> Optional[str]:
 # ── 核心解析 ──────────────────────────────────────────────────────────────────
 
 def _parse_article(article: ET.Element, if_data: dict) -> Optional[dict]:
-    """将一个 PubmedArticle XML 元素解析为 paper 字典。
+    """将一个 PubmedArticle XML 元素解析为 paper 字典。"""
+    publication_types = {
+        (pub_type.text or "").strip().lower()
+        for pub_type in article.findall(".//PublicationType")
+        if pub_type.text
+    }
+    if any("review" == pub_type or pub_type.endswith(" review") for pub_type in publication_types):
+        return None
 
-    注意：不在此处做文章类型或关键词过滤。
-    PubMed esearch 已通过检索式过滤，本函数只做解析，避免二次过滤导致结果丢失。
-    """
     # 标题
     title_elem = article.find(".//ArticleTitle")
     title = title_elem.text if title_elem is not None and title_elem.text else "No title"

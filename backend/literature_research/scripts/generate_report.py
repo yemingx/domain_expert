@@ -5,11 +5,36 @@ Markdown 报告生成模块 - 通用主题版本
 
 import argparse
 import json
+import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_for_markdown(text: str) -> str:
+    """Remove markdown heading markers from LLM-generated text to avoid breaking MD structure."""
+    return re.sub(r'^#{1,6}\s+', '', str(text), flags=re.MULTILINE)
+
+
+def _fetch_abstract_from_doi(doi: str) -> str:
+    """当 NCBI 无摘要时，从 DOI 页面抓取摘要（Europe PMC → 浏览器）。"""
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from fetch_papers import _get_abstract_from_europepmc, _get_abstract_from_browser
+        abstract = _get_abstract_from_europepmc(doi)
+        if abstract:
+            return abstract
+        abstract = _get_abstract_from_browser(doi)
+        if abstract:
+            return abstract
+    except Exception as e:
+        logger.warning("DOI 摘要抓取失败 (%s): %s", doi, e)
+    return ""
 
 
 def generate_markdown_report(
@@ -92,6 +117,10 @@ def generate_markdown_report(
         pub_date = p.get("publication_date", "—")
         author_display = p.get("author_display", "")
         abstract = p.get("abstract", "")
+        if not abstract and doi:
+            abstract = _fetch_abstract_from_doi(doi)
+            if abstract:
+                p["abstract"] = abstract
         abstract_cn = p.get("abstract_cn", "")
 
         lines += [
@@ -118,8 +147,10 @@ def generate_markdown_report(
         lines.append("")
 
         # 摘要 — 始终写入两个 section，缺失时用占位符
+        # Sanitize to prevent LLM-generated headings from breaking Markdown structure
+        safe_abstract_cn = _sanitize_for_markdown(abstract_cn) if abstract_cn else ""
         lines += ["#### 英文摘要", "", abstract or "（暂无摘要）", ""]
-        lines += ["#### 中文翻译", "", abstract_cn or "（暂无翻译）", ""]
+        lines += ["#### 中文翻译", "", safe_abstract_cn or "（暂无翻译）", ""]
 
         # 6维度分析 — 始终写入 section，缺失字段用"待分析"占位
         dims = [

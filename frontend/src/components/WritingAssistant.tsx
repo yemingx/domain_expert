@@ -2,11 +2,13 @@ import { useState } from 'react';
 import { Card, Input, Select, Button, Typography, Space, Spin } from 'antd';
 import ReactMarkdown from 'react-markdown';
 import { draftReview, suggestCitations } from '../utils/api';
+import { useSelectedWikiKbId } from '../stores/appStore';
 
 const { TextArea } = Input;
 const { Text } = Typography;
 
 export default function WritingAssistant() {
+  const selectedWikiKbId = useSelectedWikiKbId();
   const [topic, setTopic] = useState('');
   const [perspective, setPerspective] = useState('');
   const [sectionType, setSectionType] = useState('introduction');
@@ -20,7 +22,7 @@ export default function WritingAssistant() {
     if (!topic.trim()) return;
     setLoadingDraft(true);
     try {
-      const result = await draftReview(topic, perspective, sectionType);
+      const result = await draftReview(topic, perspective, sectionType, selectedWikiKbId);
       setDraft(result);
     } catch (err: any) {
       setDraft({ draft: `Error: ${err.response?.data?.detail || err.message}` });
@@ -33,7 +35,7 @@ export default function WritingAssistant() {
     if (!citationText.trim()) return;
     setLoadingCitations(true);
     try {
-      const result = await suggestCitations(citationText);
+      const result = await suggestCitations(citationText, 10, selectedWikiKbId);
       setCitationResult(result);
     } catch (err: any) {
       setCitationResult({ suggestions: `Error: ${err.response?.data?.detail || err.message}` });

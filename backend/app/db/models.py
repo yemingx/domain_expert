@@ -1,5 +1,7 @@
 """Database models — helper functions for CRUD operations using sqlite3."""
 
+from __future__ import annotations
+
 import json
 import uuid
 from datetime import datetime
@@ -9,14 +11,39 @@ def generate_id() -> str:
     return str(uuid.uuid4())
 
 
+# --- Wiki KB operations ---
+
+def create_wiki_kb(conn, *, name: str, description: str = "") -> dict:
+    kb_id = generate_id()
+    conn.execute(
+        "INSERT INTO wiki_kbs (id, name, description) VALUES (?, ?, ?)",
+        (kb_id, name, description),
+    )
+    return {"id": kb_id, "name": name, "description": description}
+
+
+def list_wiki_kbs(conn) -> list[dict]:
+    rows = conn.execute("SELECT * FROM wiki_kbs ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_wiki_kb(conn, kb_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM wiki_kbs WHERE id = ?", (kb_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_wiki_kb(conn, kb_id: str):
+    conn.execute("DELETE FROM wiki_kbs WHERE id = ?", (kb_id,))
+
+
 # --- Paper operations ---
 
-def create_paper(conn, *, paper_id: str, filename: str, filepath: str, status: str = "pending") -> dict:
+def create_paper(conn, *, paper_id: str, filename: str, filepath: str, wiki_kb_id: str | None = None, status: str = "pending") -> dict:
     conn.execute(
-        "INSERT INTO papers (id, filename, filepath, status) VALUES (?, ?, ?, ?)",
-        (paper_id, filename, filepath, status),
+        "INSERT INTO papers (id, filename, filepath, status, wiki_kb_id) VALUES (?, ?, ?, ?, ?)",
+        (paper_id, filename, filepath, status, wiki_kb_id),
     )
-    return {"id": paper_id, "filename": filename, "filepath": filepath, "status": status}
+    return {"id": paper_id, "filename": filename, "filepath": filepath, "status": status, "wiki_kb_id": wiki_kb_id}
 
 
 def get_paper(conn, paper_id: str) -> dict | None:
@@ -26,8 +53,11 @@ def get_paper(conn, paper_id: str) -> dict | None:
     return _paper_row_to_dict(row)
 
 
-def list_papers(conn) -> list[dict]:
-    rows = conn.execute("SELECT * FROM papers ORDER BY created_at DESC").fetchall()
+def list_papers(conn, wiki_kb_id: str | None = None) -> list[dict]:
+    if wiki_kb_id:
+        rows = conn.execute("SELECT * FROM papers WHERE wiki_kb_id = ? ORDER BY created_at DESC", (wiki_kb_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM papers ORDER BY created_at DESC").fetchall()
     return [_paper_row_to_dict(r) for r in rows]
 
 
@@ -52,22 +82,27 @@ def count_papers(conn, status: str | None = None) -> int:
 
 
 def _paper_row_to_dict(row) -> dict:
-    authors_raw = row["authors"]
+    row_data = dict(row)
+    authors_raw = row_data.get("authors")
     try:
         authors = json.loads(authors_raw) if authors_raw else []
     except (json.JSONDecodeError, TypeError):
         authors = []
     return {
-        "id": row["id"],
-        "title": row["title"],
+        "id": row_data["id"],
+        "title": row_data.get("title"),
         "authors": authors,
-        "year": row["year"],
-        "filename": row["filename"],
-        "filepath": row["filepath"],
-        "status": row["status"],
-        "chunks_count": row["chunks_count"],
-        "abstract": row["abstract"],
-        "created_at": row["created_at"],
+        "year": row_data.get("year"),
+        "filename": row_data["filename"],
+        "filepath": row_data["filepath"],
+        "status": row_data.get("status", "pending"),
+        "chunks_count": row_data.get("chunks_count", 0),
+        "abstract": row_data.get("abstract"),
+        "markdown_status": row_data.get("markdown_status", "none") or "none",
+        "wiki_pages_count": row_data.get("wiki_pages_count", 0) or 0,
+        "wiki_kb_id": row_data.get("wiki_kb_id"),
+        "created_at": row_data.get("created_at"),
+        "updated_at": row_data.get("updated_at"),
     }
 
 

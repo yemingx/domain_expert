@@ -1,11 +1,13 @@
 """Timeline synthesis agent - domain evolution and method comparison."""
 
+import asyncio
+
 from agents.base import BaseAgent, AgentContext, AgentResponse
 
 
 class TimelineSynthesisAgent(BaseAgent):
-    async def process(self, context: AgentContext) -> AgentResponse:
-        chunks = self.vector_store.query(context.query, n_results=20)
+    async def process(self, context: AgentContext, where_filter: dict = None) -> AgentResponse:
+        chunks = await asyncio.to_thread(self.vector_store.query, context.query, 20, where_filter)
 
         if not chunks:
             return AgentResponse(
@@ -13,7 +15,7 @@ class TimelineSynthesisAgent(BaseAgent):
                 agent_type="timeline_synthesis",
             )
 
-        answer = self.llm.generate_with_context(
+        answer = await self.llm.generate_with_context_async(
             query=context.query,
             context_chunks=chunks,
             system="""You are a domain historian and methodologist for single-cell 3D genomics.

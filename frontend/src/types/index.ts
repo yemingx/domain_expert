@@ -7,20 +7,23 @@ export interface Paper {
   status: 'pending' | 'processing' | 'completed' | 'failed';
   chunks_count: number;
   abstract: string;
+  markdown_status?: string;
+  wiki_pages_count?: number;
   created_at: string;
 }
 
 export interface Citation {
   paper_id: string;
   title: string;
-  authors: string;
-  year: number;
+  authors: string | string[];
+  year: number | null;
   page_start: number;
   page_end: number;
   excerpt: string;
 }
 
 export interface ChatMessage {
+  id?: string;
   role: 'user' | 'assistant';
   content: string;
   citations?: Citation[];
@@ -138,6 +141,8 @@ export interface KeyFigure {
   role: string;
   influence_score: number;
   institution: string;
+  author_id?: string;
+  match_confidence?: number;
 }
 
 export interface CollaborationCluster {

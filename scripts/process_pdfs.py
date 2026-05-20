@@ -31,7 +31,7 @@ async def process_existing_pdfs():
 
         try:
             # Process PDF
-            metadata, chunks, full_text = processor.process_pdf(str(pdf_file))
+            metadata, chunks, _ = processor.process_pdf(str(pdf_file))
 
             print(f"  - Title: {metadata.title or 'N/A'}")
             print(f"  - Year: {metadata.year or 'N/A'}")
@@ -41,22 +41,19 @@ async def process_existing_pdfs():
             # Create paper ID from filename
             paper_id = f"paper_{i:03d}"
 
-            # Convert chunks to dict format
-            chunk_dicts = []
-            for j, chunk in enumerate(chunks):
-                chunk_dicts.append({
-                    "content": chunk.content,
-                    "level": chunk.level,
-                    "section_type": chunk.section_type,
-                    "subsection_title": chunk.subsection_title,
-                    "page_start": chunk.page_start,
-                    "page_end": chunk.page_end,
-                    "index": j
-                })
-
-            # Add to vector store
             embedding_ids = vector_store.add_chunks(
-                chunks=chunk_dicts,
+                chunks=(
+                    {
+                        "content": chunk.content,
+                        "level": chunk.level,
+                        "section_type": chunk.section_type,
+                        "subsection_title": chunk.subsection_title,
+                        "page_start": chunk.page_start,
+                        "page_end": chunk.page_end,
+                        "index": j,
+                    }
+                    for j, chunk in enumerate(chunks)
+                ),
                 paper_id=paper_id,
                 paper_metadata=metadata.__dict__
             )

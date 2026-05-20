@@ -41,7 +41,7 @@ def process_pdf_task(self, paper_id: str, filepath: str):
             db.update_paper(conn, paper_id, status="processing")
 
             processor = PDFProcessor()
-            metadata, chunks, full_text = processor.process_pdf(filepath)
+            metadata, chunks, _ = processor.process_pdf(filepath)
 
             authors_json = json.dumps(metadata.authors) if metadata.authors else None
             db.update_paper(
@@ -53,21 +53,19 @@ def process_pdf_task(self, paper_id: str, filepath: str):
             )
 
             vector_store = get_vector_store()
-            chunk_dicts = [
-                {
-                    "content": c.content,
-                    "level": c.level,
-                    "section_type": c.section_type,
-                    "subsection_title": c.subsection_title,
-                    "page_start": c.page_start,
-                    "page_end": c.page_end,
-                    "index": i,
-                }
-                for i, c in enumerate(chunks)
-            ]
-
             embedding_ids = vector_store.add_chunks(
-                chunks=chunk_dicts,
+                chunks=(
+                    {
+                        "content": c.content,
+                        "level": c.level,
+                        "section_type": c.section_type,
+                        "subsection_title": c.subsection_title,
+                        "page_start": c.page_start,
+                        "page_end": c.page_end,
+                        "index": i,
+                    }
+                    for i, c in enumerate(chunks)
+                ),
                 paper_id=paper_id,
                 paper_metadata={
                     "title": metadata.title,

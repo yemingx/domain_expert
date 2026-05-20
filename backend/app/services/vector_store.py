@@ -1,16 +1,16 @@
 """Vector store using SQLite FTS5 — no external dependencies, instant startup."""
 
 import logging
-import math
 import re
 import sqlite3
-from typing import Optional
+from typing import Iterable, Optional, Union
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "domain_papers"
+WRITE_BATCH_SIZE = 128
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_chunks (
@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS paper_chunks (
     section_type TEXT DEFAULT '',
     page_start  INTEGER DEFAULT 0,
     page_end    INTEGER DEFAULT 0,
-    topic       TEXT DEFAULT ''
+    topic       TEXT DEFAULT '',
+    wiki_kb_id  TEXT DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_paper ON paper_chunks(paper_id);
@@ -38,6 +39,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 
 MIGRATION_ADD_TOPIC = """
 ALTER TABLE paper_chunks ADD COLUMN topic TEXT DEFAULT '';
+"""
+
+MIGRATION_ADD_WIKI_KB = """
+ALTER TABLE paper_chunks ADD COLUMN wiki_kb_id TEXT DEFAULT '';
 """
 
 
@@ -56,19 +61,30 @@ class VectorStoreService:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-20000")
+        conn.execute("PRAGMA mmap_size=268435456")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _init_db(self):
         conn = self._connect()
         conn.executescript(SCHEMA)
-        # Migrate existing DBs: add topic column if missing
+        # Run migrations for columns that may not exist yet
+        for migration in [MIGRATION_ADD_TOPIC, MIGRATION_ADD_WIKI_KB]:
+            try:
+                conn.execute(migration)
+                conn.commit()
+            except Exception:
+                pass
+        # Create indexes that depend on migrated columns (may fail if col missing, try after migration)
         try:
-            conn.execute(MIGRATION_ADD_TOPIC)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_wiki_kb ON paper_chunks(wiki_kb_id)")
             conn.commit()
-            logger.info("Migrated: added 'topic' column to paper_chunks")
         except Exception:
-            pass  # Column already exists
+            pass
         conn.close()
 
     # ------------------------------------------------------------------ #
@@ -77,39 +93,61 @@ class VectorStoreService:
 
     def add_chunks(
         self,
-        chunks: list[dict],
+        chunks: Iterable[dict],
         paper_id: str,
         paper_metadata: dict,
         topic: str = "",
+        wiki_kb_id: str = "",
     ) -> list[str]:
-        if not chunks:
-            return []
+        return self._add_chunks(
+            chunks=chunks,
+            paper_id=paper_id,
+            paper_metadata=paper_metadata,
+            topic=topic,
+            wiki_kb_id=wiki_kb_id,
+            return_ids=True,
+        )
 
+    def add_chunks_count(
+        self,
+        chunks: Iterable[dict],
+        paper_id: str,
+        paper_metadata: dict,
+        topic: str = "",
+        wiki_kb_id: str = "",
+    ) -> int:
+        return self._add_chunks(
+            chunks=chunks,
+            paper_id=paper_id,
+            paper_metadata=paper_metadata,
+            topic=topic,
+            wiki_kb_id=wiki_kb_id,
+            return_ids=False,
+        )
+
+    def _add_chunks(
+        self,
+        chunks: Iterable[dict],
+        paper_id: str,
+        paper_metadata: dict,
+        topic: str = "",
+        wiki_kb_id: str = "",
+        return_ids: bool = True,
+    ) -> Union[list[str], int]:
         conn = self._connect()
         ids: list[str] = []
+        total = 0
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            pending_rows: list[tuple] = []
+
             for i, chunk in enumerate(chunks):
                 cid = f"{paper_id}_chunk_{i:04d}"
-                content = chunk.get("content", "")
-
-                # Upsert into regular table
-                conn.execute(
-                    """
-                    INSERT INTO paper_chunks
-                        (chunk_id, content, paper_id, title, authors, year,
-                         level, section_type, page_start, page_end, topic)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chunk_id) DO UPDATE SET
-                        content=excluded.content,
-                        title=excluded.title,
-                        authors=excluded.authors,
-                        year=excluded.year,
-                        level=excluded.level,
-                        section_type=excluded.section_type,
-                        page_start=excluded.page_start,
-                        page_end=excluded.page_end,
-                        topic=excluded.topic
-                    """,
+                content = str(chunk.get("content", "") or "").strip()
+                if not content:
+                    continue
+                kb_id = wiki_kb_id or paper_metadata.get("wiki_kb_id", "")
+                pending_rows.append(
                     (
                         cid,
                         content,
@@ -122,41 +160,37 @@ class VectorStoreService:
                         int(chunk.get("page_start") or 0),
                         int(chunk.get("page_end") or 0),
                         str(topic or paper_metadata.get("topic", "")),
-                    ),
-                )
-
-                # Get rowid of the upserted row
-                row = conn.execute(
-                    "SELECT rowid FROM paper_chunks WHERE chunk_id = ?", (cid,)
-                ).fetchone()
-                rowid = row["rowid"] if row else None
-
-                # Keep FTS index in sync
-                if rowid:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO chunks_fts(rowid, content) VALUES (?, ?)",
-                        (rowid, content),
+                        str(kb_id),
                     )
-                ids.append(cid)
+                )
+                total += 1
+                if return_ids:
+                    ids.append(cid)
+
+                if len(pending_rows) >= WRITE_BATCH_SIZE:
+                    self._flush_chunk_batch(conn, pending_rows)
+                    pending_rows.clear()
+
+            if pending_rows:
+                self._flush_chunk_batch(conn, pending_rows)
 
             conn.commit()
-            logger.info("Added %d chunks for paper %s", len(ids), paper_id)
+            logger.info("Added %d chunks for paper %s", total, paper_id)
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
-        return ids
+        return ids if return_ids else total
 
     def delete_paper(self, paper_id: str):
         conn = self._connect()
         try:
-            # Remove from FTS first via rowids
-            rows = conn.execute(
-                "SELECT rowid FROM paper_chunks WHERE paper_id = ?", (paper_id,)
-            ).fetchall()
-            for r in rows:
-                conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (r["rowid"],))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM paper_chunks WHERE paper_id = ?)",
+                (paper_id,),
+            )
             conn.execute("DELETE FROM paper_chunks WHERE paper_id = ?", (paper_id,))
             conn.commit()
             logger.info("Deleted chunks for paper %s", paper_id)
@@ -164,14 +198,14 @@ class VectorStoreService:
             conn.close()
 
     def delete_by_topic(self, topic: str) -> int:
-        """Delete all chunks tagged with a given topic. Returns count deleted."""
+        """Delete all chunks scoped to a topic. Returns count deleted."""
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT rowid FROM paper_chunks WHERE topic = ?", (topic,)
-            ).fetchall()
-            for r in rows:
-                conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (r["rowid"],))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM paper_chunks WHERE topic = ?)",
+                (topic,),
+            )
             result = conn.execute(
                 "DELETE FROM paper_chunks WHERE topic = ?", (topic,)
             )
@@ -182,9 +216,63 @@ class VectorStoreService:
         finally:
             conn.close()
 
-    # ------------------------------------------------------------------ #
-    #  Read                                                                #
-    # ------------------------------------------------------------------ #
+    def delete_by_wiki_kb(self, wiki_kb_id: str) -> int:
+        """Delete all chunks scoped to a wiki KB. Returns count deleted."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM paper_chunks WHERE wiki_kb_id = ?)",
+                (wiki_kb_id,),
+            )
+            result = conn.execute(
+                "DELETE FROM paper_chunks WHERE wiki_kb_id = ?", (wiki_kb_id,)
+            )
+            conn.commit()
+            count = result.rowcount
+            logger.info("Deleted %d chunks for wiki KB '%s'", count, wiki_kb_id)
+            return count
+        finally:
+            conn.close()
+
+    def _flush_chunk_batch(self, conn: sqlite3.Connection, rows: list[tuple]) -> None:
+        conn.executemany(
+            """
+            INSERT INTO paper_chunks
+                (chunk_id, content, paper_id, title, authors, year,
+                 level, section_type, page_start, page_end, topic, wiki_kb_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                content=excluded.content,
+                title=excluded.title,
+                authors=excluded.authors,
+                year=excluded.year,
+                level=excluded.level,
+                section_type=excluded.section_type,
+                page_start=excluded.page_start,
+                page_end=excluded.page_end,
+                topic=excluded.topic,
+                wiki_kb_id=excluded.wiki_kb_id
+            """,
+            rows,
+        )
+
+        chunk_ids = [row[0] for row in rows]
+        placeholders = ",".join("?" for _ in chunk_ids)
+        rowid_rows = conn.execute(
+            f"SELECT chunk_id, rowid FROM paper_chunks WHERE chunk_id IN ({placeholders})",
+            chunk_ids,
+        ).fetchall()
+        content_by_id = {row[0]: row[1] for row in rows}
+        fts_rows = [
+            (row["rowid"], content_by_id[row["chunk_id"]])
+            for row in rowid_rows
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO chunks_fts(rowid, content) VALUES (?, ?)",
+            fts_rows,
+        )
+
 
     def query(
         self,
@@ -195,18 +283,21 @@ class VectorStoreService:
         paper_id_filter = (where_filter or {}).get("paper_id")
         topic_filter = (where_filter or {}).get("topic")
         topics_filter: list[str] = (where_filter or {}).get("topics", [])
+        wiki_kb_filter = (where_filter or {}).get("wiki_kb_id")
 
         if not query_text.strip():
             return self._fetch_chunks(
                 paper_id=paper_id_filter, topic=topic_filter,
-                topics=topics_filter, limit=n_results
+                topics=topics_filter, limit=n_results,
+                wiki_kb_id=wiki_kb_filter,
             )
 
         fts_q = self._build_fts_query(query_text)
         if not fts_q:
             return self._fetch_chunks(
                 paper_id=paper_id_filter, topic=topic_filter,
-                topics=topics_filter, limit=n_results
+                topics=topics_filter, limit=n_results,
+                wiki_kb_id=wiki_kb_filter,
             )
 
         conn = self._connect()
@@ -224,6 +315,9 @@ class VectorStoreService:
                 placeholders = ",".join("?" * len(topics_filter))
                 conditions.append(f"pc.topic IN ({placeholders})")
                 params.extend(topics_filter)
+            if wiki_kb_filter:
+                conditions.append("pc.wiki_kb_id = ?")
+                params.append(wiki_kb_filter)
 
             where_clause = " AND ".join(conditions)
             sql = f"""
@@ -243,7 +337,8 @@ class VectorStoreService:
             logger.warning("FTS query '%s' failed: %s", fts_q, exc)
             return self._fetch_chunks(
                 paper_id=paper_id_filter, topic=topic_filter,
-                topics=topics_filter, limit=n_results
+                topics=topics_filter, limit=n_results,
+                wiki_kb_id=wiki_kb_filter,
             )
         finally:
             conn.close()
@@ -289,6 +384,7 @@ class VectorStoreService:
         limit: int,
         topic: Optional[str] = None,
         topics: Optional[list] = None,
+        wiki_kb_id: Optional[str] = None,
     ) -> list[dict]:
         conn = self._connect()
         try:
@@ -304,6 +400,9 @@ class VectorStoreService:
                 placeholders = ",".join("?" * len(topics))
                 conditions.append(f"topic IN ({placeholders})")
                 params.extend(topics)
+            if wiki_kb_id:
+                conditions.append("wiki_kb_id = ?")
+                params.append(wiki_kb_id)
 
             where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
             params.append(limit)

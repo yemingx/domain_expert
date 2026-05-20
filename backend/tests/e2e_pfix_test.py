@@ -21,7 +21,17 @@ import time
 import traceback
 import urllib.request
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+import pytest
+
+if os.environ.get("RUN_E2E_TESTS") != "1":
+    pytest.skip(
+        "E2E tests require local frontend/backend services and browser setup; set RUN_E2E_TESTS=1 to run.",
+        allow_module_level=True,
+    )
+
+playwright = pytest.importorskip("playwright.sync_api")
+sync_playwright = playwright.sync_playwright
+PWTimeoutError = playwright.TimeoutError
 
 # ---------------------------------------------------------------------------
 # Configuration

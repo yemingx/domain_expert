@@ -17,10 +17,27 @@ from pathlib import Path
 from typing import Optional
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown markers from LLM-generated text so it renders cleanly in HTML."""
+    import re
+    t = str(text)
+    # headings: ### text → text
+    t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
+    # bold/italic: **text** → text, *text* → text, __text__ → text
+    t = re.sub(r'\*\*(.+?)\*\*', r'\1', t)
+    t = re.sub(r'\*(.+?)\*', r'\1', t)
+    t = re.sub(r'__(.+?)__', r'\1', t)
+    # inline code: `text` → text
+    t = re.sub(r'`(.+?)`', r'\1', t)
+    # bullet list markers at line start: "- " or "* "
+    t = re.sub(r'^[-*]\s+', '', t, flags=re.MULTILINE)
+    return t
+
+
 def _escape(text: str) -> str:
-    """HTML 转义。"""
+    """Strip markdown then HTML-escape, converting newlines to <br>."""
     return (
-        str(text)
+        _strip_markdown(str(text))
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")

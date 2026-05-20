@@ -14,6 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.config import settings
 from app.db.base import init_db
 from app.api.endpoints import router
+from app.services.llm_service import get_llm_service
+from app.services.vector_store import get_vector_store
+from app.services.literature_research_service import get_research_service
+from agents.coordinator import get_agent_coordinator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,6 +29,10 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     init_db()
     os.makedirs(settings.upload_dir, exist_ok=True)
+    get_llm_service()
+    get_vector_store()
+    get_research_service()
+    get_agent_coordinator()
     logger.info("Domain Expert API started")
     yield
     # Shutdown
@@ -43,6 +51,7 @@ origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=settings.allowed_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

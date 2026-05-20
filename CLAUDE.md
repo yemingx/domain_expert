@@ -95,7 +95,7 @@ docker-compose down -v
 # Backend
 cd backend
 source venv/bin/activate
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 # Celery worker (async PDF processing)
 cd backend
@@ -105,7 +105,7 @@ celery -A app.tasks worker --loglevel=info
 # Frontend
 cd frontend
 npm install
-npm run dev          # Vite dev server on port 5173
+npm run dev -- --host 0.0.0.0 --port 5173
 
 # Process PDFs from domain_pdf/
 cd scripts

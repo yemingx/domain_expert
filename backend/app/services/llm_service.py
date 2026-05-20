@@ -1,5 +1,6 @@
 """LLM service using Anthropic SDK (compatible with DashScope and other providers)."""
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -8,6 +9,7 @@ from anthropic import Anthropic
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+MAX_CONTEXT_CHARS = 40_000
 
 
 class LLMService:
@@ -36,7 +38,7 @@ class LLMService:
         messages: list[dict],
         system: str = "",
         max_tokens: int = 4096,
-        temperature: float = 0.7,
+        temperature: Optional[float] = 0.7,
     ) -> str:
         try:
             kwargs = {
@@ -51,9 +53,24 @@ class LLMService:
 
             response = self.client.messages.create(**kwargs)
             return self._extract_text(response)
-        except Exception as e:
-            logger.error(f"LLM chat error: {e}")
+        except Exception as exc:
+            logger.error("LLM chat error: %s", exc)
             raise
+
+    async def chat_async(
+        self,
+        messages: list[dict],
+        system: str = "",
+        max_tokens: int = 4096,
+        temperature: Optional[float] = 0.7,
+    ) -> str:
+        return await asyncio.to_thread(
+            self.chat,
+            messages,
+            system,
+            max_tokens,
+            temperature,
+        )
 
     def classify_query(self, query: str) -> str:
         system = """You are a query classifier for a scientific research assistant.
@@ -75,6 +92,9 @@ Respond with ONLY the category name, nothing else."""
             return "knowledge_retrieval"
         return category
 
+    async def classify_query_async(self, query: str) -> str:
+        return await asyncio.to_thread(self.classify_query, query)
+
     def generate_with_context(
         self,
         query: str,
@@ -82,11 +102,19 @@ Respond with ONLY the category name, nothing else."""
         system: str = "",
         max_tokens: int = 4096,
     ) -> str:
-        context_text = ""
+        context_sections: list[str] = []
+        context_chars = 0
+
         for i, chunk in enumerate(context_chunks, 1):
             paper_id = chunk.get("paper_id", "unknown")
             page = chunk.get("page_start", "?")
-            context_text += f"\n[Source {i}] (Paper: {paper_id}, Page: {page})\n{chunk['content']}\n"
+            section = f"\n[Source {i}] (Paper: {paper_id}, Page: {page})\n{chunk['content']}\n"
+            if context_chars and context_chars + len(section) > MAX_CONTEXT_CHARS:
+                break
+            context_sections.append(section)
+            context_chars += len(section)
+
+        context_text = "".join(context_sections)
 
         if not system:
             system = """You are a domain expert in single-cell 3D genomics.
@@ -101,6 +129,26 @@ Be precise and scientific in your responses."""
             }
         ]
         return self.chat(messages, system=system, max_tokens=max_tokens)
+
+    async def generate_with_context_async(
+        self,
+        query: str,
+        context_chunks: list[dict],
+        system: str = "",
+        max_tokens: int = 4096,
+    ) -> str:
+        return await asyncio.to_thread(
+            self.generate_with_context,
+            query,
+            context_chunks,
+            system,
+            max_tokens,
+        )
+
+    async def generate_raw(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
+        """Generate raw text from system + user prompt. Used by wiki compiler."""
+        messages = [{"role": "user", "content": user_prompt}]
+        return await self.chat_async(messages, system=system_prompt, max_tokens=max_tokens)
 
 
 # Singleton

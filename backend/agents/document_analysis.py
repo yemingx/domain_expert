@@ -1,18 +1,20 @@
 """Document analysis agent - deep analysis of a specific paper."""
 
+import asyncio
+
 from agents.base import BaseAgent, AgentContext, AgentResponse
 
 
 class DocumentAnalysisAgent(BaseAgent):
-    async def process(self, context: AgentContext) -> AgentResponse:
+    async def process(self, context: AgentContext, where_filter: dict = None) -> AgentResponse:
         paper_id = context.paper_id
 
+        qf = where_filter or {}
         if paper_id:
-            chunks = self.vector_store.query(
-                context.query, n_results=20, where_filter={"paper_id": paper_id}
-            )
+            qf = {**qf, "paper_id": paper_id}
+            chunks = await asyncio.to_thread(self.vector_store.query, context.query, 20, qf)
         else:
-            chunks = self.vector_store.query(context.query, n_results=15)
+            chunks = await asyncio.to_thread(self.vector_store.query, context.query, 15, qf)
 
         if not chunks:
             return AgentResponse(
@@ -20,7 +22,7 @@ class DocumentAnalysisAgent(BaseAgent):
                 agent_type="document_analysis",
             )
 
-        answer = self.llm.generate_with_context(
+        answer = await self.llm.generate_with_context_async(
             query=context.query,
             context_chunks=chunks,
             system="""You are an expert scientific paper analyst specializing in single-cell 3D genomics.

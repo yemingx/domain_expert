@@ -1,17 +1,19 @@
 """Writing assistant agent - review drafting and citation suggestions."""
 
+import asyncio
+
 from agents.base import BaseAgent, AgentContext, AgentResponse
 
 
 class WritingAssistantAgent(BaseAgent):
-    async def process(self, context: AgentContext) -> AgentResponse:
-        chunks = self.vector_store.query(context.query, n_results=15)
+    async def process(self, context: AgentContext, where_filter: dict = None) -> AgentResponse:
+        chunks = await asyncio.to_thread(self.vector_store.query, context.query, 15, where_filter)
 
         user_perspective = ""
         if context.user_perspective:
             user_perspective = f"\n\nThe user's perspective/notes:\n{context.user_perspective}"
 
-        answer = self.llm.generate_with_context(
+        answer = await self.llm.generate_with_context_async(
             query=context.query + user_perspective,
             context_chunks=chunks,
             system="""You are a scientific writing assistant for single-cell 3D genomics research.
@@ -28,8 +30,8 @@ When suggesting citations, explain why each reference is relevant.""",
         citations = self._build_citations(chunks)
         return AgentResponse(content=answer, citations=citations, agent_type="writing_assistant")
 
-    async def suggest_citations(self, query: str, n_results: int = 10) -> AgentResponse:
-        chunks = self.vector_store.query(query, n_results=n_results)
+    async def suggest_citations(self, query: str, n_results: int = 10, where_filter: dict = None) -> AgentResponse:
+        chunks = await asyncio.to_thread(self.vector_store.query, query, n_results, where_filter)
 
         if not chunks:
             return AgentResponse(content="No relevant citations found.", agent_type="writing_assistant")

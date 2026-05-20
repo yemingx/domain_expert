@@ -71,13 +71,15 @@ cp .env.example .env
 ```bash
 cd backend
 source venv/bin/activate
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+The default local setup uses the built-in SQLite metadata DB at `./data/domain_expert.db` and stores uploads, vectors, wiki data, and research outputs under `./data/`.
 
 4. **Start frontend:**
 ```bash
 cd frontend
-npm run dev
+npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
 5. **Process existing PDFs:**
@@ -148,7 +150,7 @@ python process_pdfs.py
 |----------|-------------|----------|
 | `ANTHROPIC_API_KEY` | Claude API key | Yes* |
 | `OPENAI_API_KEY` | OpenAI API key | Yes* |
-| `DATABASE_URL` | PostgreSQL connection | Yes |
+| `DATABASE_URL` | SQLite database path for local dev; PostgreSQL only for Docker/production examples | Yes |
 | `REDIS_URL` | Redis connection | Yes |
 | `SECRET_KEY` | JWT secret | Yes |
 

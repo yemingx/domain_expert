@@ -64,7 +64,11 @@ export default function LiteratureResearch() {
   const { data: jobs = [], isLoading: jobsLoading, refetch } = useQuery({
     queryKey: ['research-jobs'],
     queryFn: listResearchJobs,
-    refetchInterval: 5000,
+    refetchInterval: (query) => {
+      const data = query.state.data as ResearchJob[] | undefined;
+      const hasActiveJobs = data?.some((job) => job.status === 'pending' || job.status === 'running');
+      return pollingJobId || hasActiveJobs ? 5000 : false;
+    },
   });
 
   // Poll specific job if running
@@ -87,7 +91,7 @@ export default function LiteratureResearch() {
       queryClient.invalidateQueries({ queryKey: ['research-jobs'] });
     },
     onError: (error: any) => {
-      message.error(`Failed to start research: ${error.message}`);
+      message.error(`Failed to start research: ${error.response?.data?.detail || error.message}`);
     },
   });
 
@@ -458,7 +462,7 @@ export default function LiteratureResearch() {
             {selectedJob.stage_completed && (
               <Descriptions.Item label="Completed Stages">
                 <Space direction="vertical" size={0}>
-                  {Object.entries(selectedJob.stage_completed).map(([stage, completed]) => (
+                  {Object.entries(selectedJob.stage_completed).filter(([stage]) => stage !== 'enriching').map(([stage, completed]) => (
                     <Space key={stage}>
                       {completed ? (
                         <CheckCircleOutlined style={{ color: '#52c41a' }} />
@@ -467,7 +471,6 @@ export default function LiteratureResearch() {
                       )}
                       <Text style={{ fontSize: 12, color: completed ? undefined : '#999' }}>
                         {stage === 'searching' && '文献检索 (PubMed)'}
-                        {stage === 'enriching' && '引用富化 (Semantic Scholar)'}
                         {stage === 'analyzing' && '深度分析 (LLM)'}
                         {stage === 'converting' && '报告生成'}
                         {completed ? ' ✓' : ' (pending)'}

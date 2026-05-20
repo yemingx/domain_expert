@@ -3,18 +3,20 @@ import { Card, Select, Button, Typography, Space, Spin, Empty, Tag } from 'antd'
 import ReactMarkdown from 'react-markdown';
 import { useQuery } from '@tanstack/react-query';
 import { listPapers, evaluatePaper } from '../utils/api';
+import { useSelectedWikiKbId } from '../stores/appStore';
 import type { Paper } from '../types';
 
 const { Text } = Typography;
 
 export default function ReviewDashboard() {
+  const selectedWikiKbId = useSelectedWikiKbId();
   const [selectedPaper, setSelectedPaper] = useState<string | null>(null);
   const [evaluation, setEvaluation] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
   const { data: papers = [] } = useQuery({
-    queryKey: ['papers'],
-    queryFn: listPapers,
+    queryKey: ['papers', selectedWikiKbId],
+    queryFn: () => listPapers(selectedWikiKbId),
   });
 
   const completedPapers = papers.filter((p: Paper) => p.status === 'completed');
@@ -23,7 +25,7 @@ export default function ReviewDashboard() {
     if (!selectedPaper) return;
     setLoading(true);
     try {
-      const result = await evaluatePaper(selectedPaper);
+      const result = await evaluatePaper(selectedPaper, [], selectedWikiKbId);
       setEvaluation(result);
     } catch (err: any) {
       setEvaluation({ evaluation: `Error: ${err.response?.data?.detail || err.message}` });

@@ -1,6 +1,6 @@
 """Reviewer agent - paper evaluation with scoring rubric."""
 
-import json
+import asyncio
 
 from agents.base import BaseAgent, AgentContext, AgentResponse
 
@@ -17,15 +17,15 @@ class ReviewerAgent(BaseAgent):
         "Literature Coverage",
     ]
 
-    async def process(self, context: AgentContext) -> AgentResponse:
+    async def process(self, context: AgentContext, where_filter: dict = None) -> AgentResponse:
         paper_id = context.paper_id
 
+        qf = where_filter or {}
         if paper_id:
-            chunks = self.vector_store.query(
-                context.query, n_results=25, where_filter={"paper_id": paper_id}
-            )
+            qf = {**qf, "paper_id": paper_id}
+            chunks = await asyncio.to_thread(self.vector_store.query, context.query, 25, qf)
         else:
-            chunks = self.vector_store.query(context.query, n_results=20)
+            chunks = await asyncio.to_thread(self.vector_store.query, context.query, 20, qf)
 
         if not chunks:
             return AgentResponse(
@@ -33,9 +33,9 @@ class ReviewerAgent(BaseAgent):
                 agent_type="reviewer",
             )
 
-        categories_str = "\n".join(f"- {c}" for c in self.RUBRIC_CATEGORIES)
+        categories_str = "\n".join(f"- {category}" for category in self.RUBRIC_CATEGORIES)
 
-        answer = self.llm.generate_with_context(
+        answer = await self.llm.generate_with_context_async(
             query=context.query,
             context_chunks=chunks,
             system=f"""You are an expert peer reviewer for single-cell 3D genomics papers.

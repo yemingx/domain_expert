@@ -13,7 +13,14 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 import requests
+
+if os.environ.get("RUN_E2E_TESTS") != "1":
+    pytest.skip(
+        "E2E tests require local frontend/backend services and browser setup; set RUN_E2E_TESTS=1 to run.",
+        allow_module_level=True,
+    )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BACKEND_URL = "http://localhost:8000/api/v1"

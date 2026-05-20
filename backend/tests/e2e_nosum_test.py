@@ -18,7 +18,18 @@ import io
 import sys
 import os
 import urllib.request
-from playwright.sync_api import sync_playwright, Page
+
+import pytest
+
+if os.environ.get("RUN_E2E_TESTS") != "1":
+    pytest.skip(
+        "E2E tests require local frontend/backend services and browser setup; set RUN_E2E_TESTS=1 to run.",
+        allow_module_level=True,
+    )
+
+playwright = pytest.importorskip("playwright.sync_api")
+sync_playwright = playwright.sync_playwright
+Page = playwright.Page
 
 # Force UTF-8 output on Windows
 if hasattr(sys.stdout, 'reconfigure'):

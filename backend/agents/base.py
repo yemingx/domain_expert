@@ -57,6 +57,6 @@ class BaseAgent(ABC):
                 year=chunk.get("year", 0),
                 page_start=chunk.get("page_start", 0),
                 page_end=chunk.get("page_end", 0),
-                excerpt=chunk.get("content", "")[:200],
+                excerpt=chunk.get("content", "")[:1200],
             ))
         return citations

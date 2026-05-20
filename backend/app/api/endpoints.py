@@ -6,10 +6,12 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 import zipfile
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -20,7 +22,7 @@ from app.db.base import get_db
 from app.db import models as db
 from app.services.llm_service import get_llm_service
 from app.services.vector_store import get_vector_store
-from agents.coordinator import AgentCoordinator
+from agents.coordinator import get_agent_coordinator
 from agents.base import AgentContext
 
 from app.services.literature_research_service import (
@@ -31,6 +33,76 @@ from app.services.literature_research_service import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+_writing_assistant_agent = None
+_reviewer_agent = None
+_ingest_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_ingest_semaphore() -> asyncio.Semaphore:
+    global _ingest_semaphore
+    if _ingest_semaphore is None:
+        concurrency = max(1, int(settings.knowledge_import_concurrency or 1))
+        _ingest_semaphore = asyncio.Semaphore(concurrency)
+    return _ingest_semaphore
+
+
+def _log_background_task(task: asyncio.Task):
+    try:
+        task.result()
+    except Exception as exc:
+        logger.error("Background task failed: %s", exc)
+
+
+def _schedule_background(coro):
+    task = asyncio.create_task(coro)
+    task.add_done_callback(_log_background_task)
+    return task
+
+
+async def _run_upload_pipeline(paper_id: str, filepath: str, filename: str, wiki_kb_id: Optional[str] = None):
+    semaphore = _get_ingest_semaphore()
+    logger.info("Upload pipeline queued for paper %s", paper_id)
+
+    async with semaphore:
+        logger.info("Upload pipeline started for paper %s", paper_id)
+        await asyncio.to_thread(_process_pdf_sync, paper_id, filepath)
+        if wiki_kb_id:
+            await asyncio.to_thread(_process_mineru_and_wiki, paper_id, filepath, filename, wiki_kb_id)
+        logger.info("Upload pipeline finished for paper %s", paper_id)
+
+
+def get_writing_assistant_agent():
+    global _writing_assistant_agent
+    if _writing_assistant_agent is None:
+        from agents.writing_assistant import WritingAssistantAgent
+        _writing_assistant_agent = WritingAssistantAgent(get_llm_service(), get_vector_store())
+    return _writing_assistant_agent
+
+
+def get_reviewer_agent():
+    global _reviewer_agent
+    if _reviewer_agent is None:
+        from agents.reviewer import ReviewerAgent
+        _reviewer_agent = ReviewerAgent(get_llm_service(), get_vector_store())
+    return _reviewer_agent
+
+
+def _convert_markdown_to_reports_sync(md_path, output_dir, formats):
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).parent.parent.parent / "literature_research" / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from md_to_reports import convert_markdown_to_reports
+
+    return convert_markdown_to_reports(
+        md_path=md_path,
+        output_dir=output_dir,
+        formats=formats,
+    )
+
 
 # --- Request/Response models ---
 
@@ -40,6 +112,7 @@ class QueryRequest(BaseModel):
     n_results: int = 10
     topic: Optional[str] = None        # Single topic filter
     topics: list[str] = []             # Multi-topic filter (OR logic)
+    wiki_kb_id: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -48,11 +121,13 @@ class ChatRequest(BaseModel):
     paper_id: Optional[str] = None
     topic: Optional[str] = None        # Restrict to this expert KB
     topics: list[str] = []             # Restrict to these expert KBs (OR)
+    wiki_kb_id: Optional[str] = None
 
 
 class CompareRequest(BaseModel):
     methods: list[str]
     aspects: list[str] = []
+    wiki_kb_id: Optional[str] = None
 
 
 class DraftReviewRequest(BaseModel):
@@ -61,10 +136,12 @@ class DraftReviewRequest(BaseModel):
     section_type: str = "introduction"
     expert_topic: Optional[str] = None   # Which expert KB to use
     expert_topics: list[str] = []        # Multiple expert KBs
+    wiki_kb_id: Optional[str] = None
 
 
 class CitationRequest(BaseModel):
     text: str
+    wiki_kb_id: Optional[str] = None
     n_results: int = 10
     expert_topic: Optional[str] = None
     expert_topics: list[str] = []
@@ -75,6 +152,7 @@ class EvaluateRequest(BaseModel):
     focus_areas: list[str] = []
     expert_topic: Optional[str] = None
     expert_topics: list[str] = []
+    wiki_kb_id: Optional[str] = None
 
 
 # --- Research endpoints (NEW) ---
@@ -201,7 +279,7 @@ async def import_research_to_kb(job_id: str):
     service = get_research_service()
     vs = get_vector_store()
     try:
-        chunk_count = service.import_to_knowledge_base(job_id, vs)
+        chunk_count = await asyncio.to_thread(service.import_to_knowledge_base, job_id, vs)
         return {"job_id": job_id, "chunks_added": chunk_count}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -219,7 +297,7 @@ async def list_expert_topics():
 async def delete_topic_kb(topic: str):
     """Delete all chunks for a given topic from the knowledge base."""
     vs = get_vector_store()
-    deleted = vs.delete_by_topic(topic)
+    deleted = await asyncio.to_thread(vs.delete_by_topic, topic)
     return {"topic": topic, "deleted_chunks": deleted}
 
 
@@ -232,7 +310,6 @@ async def download_research_report(job_id: str):
     (fast path).  Otherwise all converted files are generated on demand and
     packaged into a ZIP that is streamed back to the client.
     """
-    import sys
     from pathlib import Path
 
     service = get_research_service()
@@ -302,16 +379,12 @@ async def download_research_report(job_id: str):
         }
         missing = [fmt for fmt, fp in target_map.items() if not fp.exists()]
         if missing:
-            scripts_dir = (
-                Path(__file__).parent.parent.parent / "literature_research" / "scripts"
-            )
-            if str(scripts_dir) not in sys.path:
-                sys.path.insert(0, str(scripts_dir))
             try:
-                from md_to_reports import convert_markdown_to_reports
                 await asyncio.to_thread(
-                    convert_markdown_to_reports,
-                    md_path=md_path, output_dir=output_dir, formats=missing,
+                    _convert_markdown_to_reports_sync,
+                    md_path,
+                    output_dir,
+                    missing,
                 )
             except Exception as e:
                 logger.error("Format conversion failed for job %s: %s", job_id, e)
@@ -359,7 +432,6 @@ async def convert_research_report(job_id: str, request: ConvertRequest = None):
 
     Returns a .zip with all generated files.
     """
-    import sys
     from pathlib import Path
 
     service = get_research_service()
@@ -375,41 +447,36 @@ async def convert_research_report(job_id: str, request: ConvertRequest = None):
 
     formats = (request.formats if request else None) or ["word", "html", "html_ppt", "pdf_ppt"]
 
-    scripts_dir = Path(__file__).parent.parent.parent / "literature_research" / "scripts"
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
-
-    try:
-        from md_to_reports import convert_markdown_to_reports
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"md_to_reports module not found: {e}")
-
     md_path = Path(result_path)
     output_dir = md_path.parent
 
     try:
-        results = convert_markdown_to_reports(
-            md_path=md_path,
-            output_dir=output_dir,
-            formats=formats,
+        results = await asyncio.to_thread(
+            _convert_markdown_to_reports_sync,
+            md_path,
+            output_dir,
+            formats,
         )
     except Exception as e:
         logger.error("Format conversion failed for job %s: %s", job_id, e)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
 
-    # Package all generated files into a zip
-    buf = io.BytesIO()
-    files_added = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fmt, path in results.items():
-            if path and Path(path).exists():
-                zf.write(path, Path(path).name)
-                files_added += 1
+    def _build_zip() -> io.BytesIO:
+        buf = io.BytesIO()
+        files_added = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fmt, path in results.items():
+                if path and Path(path).exists():
+                    zf.write(path, Path(path).name)
+                    files_added += 1
 
-    if files_added == 0:
-        raise HTTPException(status_code=500, detail="No output files were generated")
+        if files_added == 0:
+            raise HTTPException(status_code=500, detail="No output files were generated")
 
-    buf.seek(0)
+        buf.seek(0)
+        return buf
+
+    buf = await asyncio.to_thread(_build_zip)
     filename = f"report_{job.topic}_{job_id[:8]}.zip"
     return StreamingResponse(
         buf,
@@ -448,7 +515,6 @@ async def download_research_file(job_id: str, file_format: str):
     - html_ppt   : HTML PPT version
     - pdf_ppt    : PDF PPT version (may take a while to generate)
     """
-    import sys
     from pathlib import Path
 
     if file_format not in _FORMAT_MEDIA_TYPES:
@@ -530,18 +596,16 @@ async def download_research_file(job_id: str, file_format: str):
     target = target_map[file_format]
 
     if not target.exists():
-        scripts_dir = Path(__file__).parent.parent.parent / "literature_research" / "scripts"
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
         try:
-            from md_to_reports import convert_markdown_to_reports
-            # pdf_ppt requires html_ppt to exist first
             gen_formats = (
                 [file_format] if file_format != "pdf_ppt"
                 else (["html_ppt", "pdf_ppt"] if not target_map["html_ppt"].exists() else ["pdf_ppt"])
             )
-            convert_markdown_to_reports(
-                md_path=md_path, output_dir=output_dir, formats=gen_formats
+            await asyncio.to_thread(
+                _convert_markdown_to_reports_sync,
+                md_path,
+                output_dir,
+                gen_formats,
             )
         except Exception as e:
             logger.error("File generation failed for job %s format %s: %s", job_id, file_format, e)
@@ -598,6 +662,14 @@ def _job_to_response(job: ResearchJob) -> ResearchJobResponse:
 
 # --- Paper endpoints ---
 
+class PaperStatusResponse(BaseModel):
+    paper_id: str
+    filename: str
+    status: str
+    markdown_status: str = "pending"
+    wiki_pages: list[str] = []
+
+
 @router.post("/papers/upload")
 async def upload_paper(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -618,14 +690,61 @@ async def upload_paper(file: UploadFile = File(...)):
     with get_db() as conn:
         db.create_paper(conn, paper_id=paper_id, filename=file.filename, filepath=filepath)
 
-    # Process synchronously (Celery optional)
-    _process_pdf_sync(paper_id, filepath)
+    _schedule_background(_run_upload_pipeline(paper_id, filepath, file.filename))
 
     return {"paper_id": paper_id, "filename": file.filename, "status": "processing"}
 
 
+@router.post("/papers/upload-with-mineru")
+async def upload_paper_mineru(file: UploadFile = File(...), wiki_kb_id: Optional[str] = Form(None)):
+    """Upload PDF and convert via MinerU API to Markdown, then index into LLM Wiki."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    if not settings.mineru_api_token:
+        raise HTTPException(status_code=503, detail="MinerU API token not configured. Set MINERU_API_TOKEN in .env")
+
+    os.makedirs(settings.upload_dir, exist_ok=True)
+
+    paper_id = str(uuid.uuid4())
+    filepath = os.path.join(settings.upload_dir, f"{paper_id}.pdf")
+
+    content = await file.read()
+    if len(content) > settings.max_upload_size:
+        raise HTTPException(status_code=413, detail="File too large")
+
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    with get_db() as conn:
+        db.create_paper(conn, paper_id=paper_id, filename=file.filename, filepath=filepath, wiki_kb_id=wiki_kb_id)
+        if wiki_kb_id:
+            db.update_paper(conn, paper_id, markdown_status="converting")
+
+    _schedule_background(_run_upload_pipeline(paper_id, filepath, file.filename, wiki_kb_id))
+
+    return {
+        "paper_id": paper_id,
+        "filename": file.filename,
+        "status": "processing",
+        "markdown_status": "converting" if wiki_kb_id else "skipped",
+        "wiki_kb_id": wiki_kb_id,
+    }
+
+
+@router.get("/papers/{paper_id}/markdown")
+async def get_paper_markdown(paper_id: str, kb_id: Optional[str] = None):
+    """Get the MinerU-converted markdown for a paper."""
+    from app.services.wiki_service import get_wiki_service
+    wiki = get_wiki_service(kb_id or "")
+    raw = wiki.get_raw_source(paper_id)
+    if not raw:
+        raise HTTPException(status_code=404, detail="Markdown not found. The paper may still be processing.")
+    return {"paper_id": paper_id, "markdown": raw}
+
+
 def _process_pdf_sync(paper_id: str, filepath: str):
-    """Synchronous PDF processing."""
+    """Synchronous PDF processing with PyMuPDF fallback."""
     from app.services.pdf_processor import PDFProcessor
 
     with get_db() as conn:
@@ -633,7 +752,7 @@ def _process_pdf_sync(paper_id: str, filepath: str):
             db.update_paper(conn, paper_id, status="processing")
 
             processor = PDFProcessor()
-            metadata, chunks, full_text = processor.process_pdf(filepath)
+            metadata, chunks, _ = processor.process_pdf(filepath)
 
             authors_json = json.dumps(metadata.authors) if metadata.authors else None
             db.update_paper(
@@ -646,21 +765,19 @@ def _process_pdf_sync(paper_id: str, filepath: str):
             )
 
             vector_store = get_vector_store()
-            chunk_dicts = [
-                {
-                    "content": c.content,
-                    "level": c.level,
-                    "section_type": c.section_type,
-                    "subsection_title": c.subsection_title,
-                    "page_start": c.page_start,
-                    "page_end": c.page_end,
-                    "index": i,
-                }
-                for i, c in enumerate(chunks)
-            ]
-
             embedding_ids = vector_store.add_chunks(
-                chunks=chunk_dicts,
+                chunks=(
+                    {
+                        "content": c.content,
+                        "level": c.level,
+                        "section_type": c.section_type,
+                        "subsection_title": c.subsection_title,
+                        "page_start": c.page_start,
+                        "page_end": c.page_end,
+                        "index": i,
+                    }
+                    for i, c in enumerate(chunks)
+                ),
                 paper_id=paper_id,
                 paper_metadata={"title": metadata.title, "authors": metadata.authors, "year": metadata.year},
             )
@@ -673,10 +790,154 @@ def _process_pdf_sync(paper_id: str, filepath: str):
             db.update_paper(conn, paper_id, status="failed")
 
 
+def _process_mineru_and_wiki(paper_id: str, filepath: str, filename: str, kb_id: str = ""):
+    """Convert PDF via MinerU, store raw markdown, and trigger wiki ingestion."""
+    from app.services.mineru_service import get_mineru_service
+    from app.services.wiki_service import get_wiki_service
+
+    mineru = get_mineru_service()
+    wiki = get_wiki_service(kb_id)
+
+    output_dir = os.path.join(settings.upload_dir, f"{paper_id}_mineru")
+
+    try:
+        result = mineru.convert_pdf(filepath, output_dir)
+
+        if not result.get("success"):
+            logger.error(f"MinerU conversion failed for {paper_id}: {result.get('error')}")
+            with get_db() as conn:
+                db.update_paper(conn, paper_id, markdown_status="failed", wiki_kb_id=kb_id)
+            return
+
+        markdown = result.get("markdown", "")
+
+        with get_db() as conn:
+            paper = db.get_paper(conn, paper_id) or {}
+
+        title = paper.get("title") or filename
+        authors = paper.get("authors", [])
+        year = paper.get("year") or 0
+
+        wiki.add_raw_source(paper_id, markdown, {
+            "title": title,
+            "authors": _paper_authors_text(authors),
+            "year": str(year or ""),
+        })
+
+        vector_store = get_vector_store()
+        vector_store.delete_paper(paper_id)
+        chunk_ids = vector_store.add_chunks(
+            chunks=(
+                {
+                    "content": chunk["content"],
+                    "level": chunk.get("section_type", "atomic"),
+                    "section_type": chunk.get("section_type", ""),
+                    "page_start": 0,
+                    "page_end": 0,
+                    "index": i,
+                }
+                for i, chunk in enumerate(_iter_markdown_chunks(markdown))
+            ),
+            paper_id=paper_id,
+            paper_metadata={"title": title, "authors": _paper_authors_text(authors), "year": year},
+            wiki_kb_id=kb_id,
+        )
+
+        with get_db() as conn:
+            db.update_paper(
+                conn,
+                paper_id,
+                wiki_kb_id=kb_id,
+                markdown_status="completed",
+                chunks_count=len(chunk_ids),
+            )
+        logger.info(f"MinerU+Wiki processing complete for {paper_id}: {len(chunk_ids)} chunks indexed")
+
+    except Exception as e:
+        logger.error(f"MinerU processing error for {paper_id}: {e}")
+        with get_db() as conn:
+            db.update_paper(conn, paper_id, markdown_status="failed", wiki_kb_id=kb_id)
+
+
+_MARKDOWN_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+)")
+
+
+def _iter_markdown_chunks(markdown: str, max_chunk_size: int = 1000, overlap: int = 150):
+    """Stream markdown chunks by heading to reduce peak memory during import."""
+    yield from _iter_markdown_chunk_lines(io.StringIO(markdown), max_chunk_size=max_chunk_size, overlap=overlap)
+
+
+def _iter_markdown_file_chunks(markdown_path: str, max_chunk_size: int = 1000, overlap: int = 150):
+    with open(markdown_path, "r", encoding="utf-8", errors="replace") as markdown_file:
+        yield from _iter_markdown_chunk_lines(markdown_file, max_chunk_size=max_chunk_size, overlap=overlap)
+
+
+def _iter_markdown_chunk_lines(lines, max_chunk_size: int = 1000, overlap: int = 150):
+    """Shared line-based markdown chunker for strings and files."""
+    current_lines: list[str] = []
+    current_section_type = "body"
+
+    def _yield_section(section_text: str, section_type: str):
+        if len(section_text) <= max_chunk_size:
+            yield {"content": section_text, "section_type": section_type}
+            return
+
+        start = 0
+        while start < len(section_text):
+            end = min(start + max_chunk_size, len(section_text))
+            chunk_text = section_text[start:end].strip()
+            if chunk_text:
+                yield {"content": chunk_text, "section_type": section_type}
+            if end >= len(section_text):
+                break
+            start = max(0, end - overlap)
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+        heading_match = _MARKDOWN_HEADING_RE.match(line.strip())
+
+        if heading_match and current_lines:
+            section_text = "\n".join(current_lines).strip()
+            if len(section_text) >= 30:
+                yield from _yield_section(section_text, current_section_type)
+            current_lines = [line]
+            current_section_type = heading_match.group(2).strip()
+            continue
+
+        if heading_match and not current_lines:
+            current_section_type = heading_match.group(2).strip()
+
+        current_lines.append(line)
+
+    if current_lines:
+        section_text = "\n".join(current_lines).strip()
+        if len(section_text) >= 30:
+            yield from _yield_section(section_text, current_section_type)
+
+
+def _split_markdown_chunks(markdown: str, max_chunk_size: int = 1000, overlap: int = 150) -> list[dict]:
+    return list(_iter_markdown_chunks(markdown, max_chunk_size=max_chunk_size, overlap=overlap))
+
+
+
+def _paper_authors_text(authors) -> str:
+    if isinstance(authors, list):
+        return ", ".join(str(author) for author in authors if author)
+    return str(authors or "")
+
+
+
+def _count_wiki_pages_for_paper(kb_id: str, paper_id: str) -> int:
+    from app.services.wiki_service import get_wiki_service
+
+    wiki = get_wiki_service(kb_id)
+    return sum(1 for page in wiki.list_pages() if paper_id in page.get("source_paper_ids", []))
+
+
 @router.get("/papers")
-async def list_papers_endpoint():
+async def list_papers_endpoint(wiki_kb_id: Optional[str] = None):
     with get_db() as conn:
-        return db.list_papers(conn)
+        return db.list_papers(conn, wiki_kb_id=wiki_kb_id)
 
 
 @router.get("/papers/{paper_id}")
@@ -688,16 +949,392 @@ async def get_paper(paper_id: str):
         return paper
 
 
+# --- Wiki KB CRUD ---
+
+class WikiKBCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+@router.get("/wiki/kbs")
+async def list_wiki_kbs():
+    """List all wiki knowledge bases."""
+    with get_db() as conn:
+        return db.list_wiki_kbs(conn)
+
+
+@router.post("/wiki/kbs")
+async def create_wiki_kb(req: WikiKBCreateRequest):
+    """Create a new wiki knowledge base."""
+    with get_db() as conn:
+        kb = db.create_wiki_kb(conn, name=req.name, description=req.description)
+        return kb
+
+
+@router.delete("/wiki/kbs/{kb_id}")
+async def delete_wiki_kb(kb_id: str):
+    """Delete a wiki knowledge base."""
+    import shutil
+    from app.services.wiki_service import get_wiki_service
+
+    vector_store = get_vector_store()
+    wiki = get_wiki_service(kb_id)
+
+    with get_db() as conn:
+        kb = db.get_wiki_kb(conn, kb_id)
+        if not kb:
+            raise HTTPException(status_code=404, detail="Wiki KB not found")
+
+        papers = db.list_papers(conn, wiki_kb_id=kb_id)
+        for paper in papers:
+            db.update_paper(
+                conn,
+                paper["id"],
+                wiki_kb_id=None,
+                wiki_pages_count=0,
+                markdown_status="none",
+            )
+        db.delete_wiki_kb(conn, kb_id)
+
+    deleted_chunks = await asyncio.to_thread(vector_store.delete_by_wiki_kb, kb_id)
+    await asyncio.to_thread(shutil.rmtree, wiki.wiki_dir, True)
+    return {"status": "deleted", "kb_id": kb_id, "papers_reset": len(papers), "chunks_deleted": deleted_chunks}
+
+
+# --- Research import into Wiki KB ---
+
+class ResearchImportRequest(BaseModel):
+    kb_id: str
+    job_id: str
+
+
+@router.post("/wiki/import-research")
+async def import_research_to_wiki(req: ResearchImportRequest):
+    """Import completed research markdown into a wiki KB."""
+    kb_id = req.kb_id
+    job_id = req.job_id
+
+    service = get_research_service()
+    job = service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Research job not found")
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail="Research job not completed yet")
+
+    report_path = getattr(job, "result_path", "")
+    if not report_path or not os.path.exists(report_path):
+        raise HTTPException(status_code=404, detail=f"Research report not found at {report_path or 'unknown path'}")
+
+    topic = job.topic
+
+    def _do_import():
+        from app.services.wiki_service import get_wiki_service
+        wiki = get_wiki_service(kb_id)
+        wiki.add_raw_source_from_file(f"research_{job_id}", report_path, {
+            "title": f"Research: {topic}",
+            "authors": "",
+            "year": str(datetime.now().year),
+        })
+
+        vector_store = get_vector_store()
+        chunk_count = vector_store.add_chunks_count(
+            chunks=(
+                {
+                    "content": chunk["content"],
+                    "level": chunk.get("section_type", "atomic"),
+                    "section_type": chunk.get("section_type", ""),
+                    "page_start": 0,
+                    "page_end": 0,
+                    "index": i,
+                }
+                for i, chunk in enumerate(_iter_markdown_file_chunks(report_path))
+            ),
+            paper_id=f"research_{job_id}",
+            paper_metadata={"title": f"Research: {topic}", "authors": "", "year": 0},
+            wiki_kb_id=kb_id,
+        )
+
+        paper_id = f"research_import_{job_id}_{kb_id or 'default'}"
+        with get_db() as conn:
+            if not db.get_paper(conn, paper_id):
+                db.create_paper(conn, paper_id=paper_id, filename=f"research_{topic}.md",
+                                filepath=report_path, wiki_kb_id=kb_id, status="completed")
+            db.update_paper(
+                conn,
+                paper_id,
+                title=f"Research: {topic}",
+                authors=json.dumps([]),
+                year=datetime.now().year,
+                markdown_status="completed",
+                chunks_count=chunk_count,
+                wiki_pages_count=0,
+                wiki_kb_id=kb_id,
+            )
+
+        logger.info(f"Research import completed: kb={kb_id}, job={job_id}, chunks={chunk_count}")
+        return {"paper_id": paper_id, "chunks": chunk_count}
+
+    try:
+        import_result = await asyncio.to_thread(_do_import)
+    except Exception as exc:
+        logger.error(f"Research import failed: kb={kb_id}, job={job_id}, error={exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "status": "imported",
+        "kb_id": kb_id,
+        "job_id": job_id,
+        "paper_id": import_result["paper_id"],
+        "chunks": import_result["chunks"],
+    }
+
+
+# --- Paper markdown import into KB ---
+
+class PaperImportRequest(BaseModel):
+    kb_id: str
+    paper_id: str
+
+
+@router.post("/wiki/import-paper")
+async def import_paper_to_wiki_kb(req: PaperImportRequest):
+    """Import an already-uploaded paper's markdown into a wiki KB."""
+    from app.services.wiki_service import get_wiki_service
+
+    with get_db() as conn:
+        paper = db.get_paper(conn, req.paper_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found")
+
+    def _do_import() -> dict:
+        original_md = ""
+        pdf_path = paper.get("filepath", "")
+        if os.path.exists(pdf_path):
+            from app.services.mineru_service import get_mineru_service
+
+            mineru = get_mineru_service()
+            output_dir = os.path.join(settings.upload_dir, f"{req.paper_id}_mineru_import")
+            result = mineru.convert_pdf(pdf_path, output_dir)
+            if result.get("success"):
+                original_md = result.get("markdown", "")
+
+        if not original_md:
+            raise ValueError("Failed to convert paper via MinerU")
+
+        wiki = get_wiki_service(req.kb_id)
+        wiki.add_raw_source(req.paper_id, original_md, {
+            "title": paper.get("title", paper.get("filename", "")),
+            "authors": json.dumps(paper.get("authors", [])) if isinstance(paper.get("authors"), list) else paper.get("authors", ""),
+            "year": str(paper.get("year", "")),
+        })
+
+        vector_store = get_vector_store()
+        vector_store.delete_paper(req.paper_id)
+        chunk_ids = vector_store.add_chunks(
+            chunks=(
+                {
+                    "content": chunk["content"],
+                    "level": chunk.get("section_type", "atomic"),
+                    "section_type": chunk.get("section_type", ""),
+                    "page_start": 0,
+                    "page_end": 0,
+                    "index": i,
+                }
+                for i, chunk in enumerate(_iter_markdown_chunks(original_md))
+            ),
+            paper_id=req.paper_id,
+            paper_metadata={
+                "title": paper.get("title", ""),
+                "authors": _paper_authors_text(paper.get("authors", [])),
+                "year": int(paper.get("year", 0)) if paper.get("year") else 0,
+            },
+            wiki_kb_id=req.kb_id,
+        )
+
+        wiki_pages_count = _count_wiki_pages_for_paper(req.kb_id, req.paper_id)
+
+        with get_db() as conn:
+            db.update_paper(conn, req.paper_id, wiki_kb_id=req.kb_id, markdown_status="completed",
+                            chunks_count=len(chunk_ids), wiki_pages_count=wiki_pages_count)
+
+        return {"chunks": len(chunk_ids)}
+
+    try:
+        import_result = await asyncio.to_thread(_do_import)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"status": "imported", "kb_id": req.kb_id, "paper_id": req.paper_id, "chunks": import_result["chunks"]}
+
+
+# --- Wiki endpoints ---
+
+class WikiIngestRequest(BaseModel):
+    paper_id: Optional[str] = None
+    markdown: Optional[str] = None
+    kb_id: str = ""
+
+
+@router.get("/wiki/pages")
+async def list_wiki_pages(kb_id: Optional[str] = None):
+    """List all compiled wiki pages for a KB."""
+    from app.services.wiki_service import get_wiki_service
+    wiki = get_wiki_service(kb_id or "")
+    return wiki.list_pages()
+
+
+@router.get("/wiki/pages/{slug}")
+async def get_wiki_page(slug: str, kb_id: Optional[str] = None):
+    """Get a single wiki page by slug."""
+    from app.services.wiki_service import get_wiki_service
+    wiki = get_wiki_service(kb_id or "")
+    page = wiki.get_page(slug)
+    if not page:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    return {
+        "slug": page.slug,
+        "title": page.title,
+        "content": page.content,
+        "page_type": page.page_type,
+        "source_paper_ids": page.source_paper_ids,
+        "cross_refs": page.cross_refs,
+        "created_at": page.created_at,
+        "updated_at": page.updated_at,
+    }
+
+
+@router.post("/wiki/ingest")
+async def wiki_ingest(request: WikiIngestRequest):
+    """Trigger LLM-driven wiki ingestion."""
+    from app.services.wiki_service import get_wiki_service
+    kb_id = request.kb_id or ""
+    wiki = get_wiki_service(kb_id)
+
+    if request.paper_id:
+        raw_md = wiki.get_raw_source(request.paper_id)
+        if not raw_md:
+            raise HTTPException(status_code=404, detail="Raw markdown not found for this paper_id")
+        markdown = raw_md
+        paper_id = request.paper_id
+    elif request.markdown:
+        markdown = request.markdown
+        paper_id = "manual"
+    else:
+        raise HTTPException(status_code=400, detail="Provide paper_id or markdown")
+
+    llm = get_llm_service()
+    schema = (wiki.schema_dir / "AGENTS.md").read_text(encoding="utf-8")
+    existing_pages = wiki.list_pages()
+
+    wiki_update = await _llm_compile_wiki(llm, schema, existing_pages, markdown, paper_id)
+
+    pages_created = []
+    for page_data in wiki_update.get("pages", []):
+        from app.services.wiki_service import WikiPage, _slugify
+        slug = _slugify(page_data.get("title", "untitled"))
+        page = wiki.get_page(slug)
+        if page:
+            page.content = page_data.get("content", page.content)
+            if paper_id not in page.source_paper_ids:
+                page.source_paper_ids.append(paper_id)
+            for ref in page_data.get("cross_refs", []):
+                if ref not in page.cross_refs:
+                    page.cross_refs.append(ref)
+        else:
+            page = WikiPage(
+                slug=slug,
+                title=page_data.get("title", "Untitled"),
+                content=page_data.get("content", ""),
+                page_type=page_data.get("page_type", "entity"),
+                source_paper_ids=[paper_id],
+                cross_refs=page_data.get("cross_refs", []),
+            )
+        wiki.save_page(page)
+        pages_created.append({"slug": page.slug, "title": page.title, "page_type": page.page_type})
+
+    if request.paper_id:
+        wiki_pages_count = _count_wiki_pages_for_paper(kb_id, paper_id)
+        with get_db() as conn:
+            if db.get_paper(conn, paper_id):
+                db.update_paper(
+                    conn,
+                    paper_id,
+                    wiki_kb_id=kb_id or None,
+                    wiki_pages_count=wiki_pages_count,
+                    markdown_status="completed",
+                )
+
+    return {"status": "ok", "pages_created": pages_created, "paper_id": paper_id}
+
+
+@router.get("/wiki/search")
+async def wiki_search(q: str, kb_id: Optional[str] = None, limit: int = 10):
+    """Search across wiki pages and raw sources."""
+    from app.services.wiki_service import get_wiki_service
+    wiki = get_wiki_service(kb_id or "")
+    return _do_wiki_search(wiki, q, limit)
+
+
+def _do_wiki_search(wiki, q: str, limit: int = 10) -> list[dict]:
+    query_tokens = set(re.findall(r"[a-zA-Z0-9]{3,}", q.lower()))
+    results = []
+
+    for page in wiki.list_pages():
+        content = wiki.get_page(page["slug"])
+        if not content:
+            continue
+        score = sum(1 for t in query_tokens if t in content.content.lower())
+        if score > 0:
+            results.append({
+                "type": "wiki_page",
+                "slug": page["slug"],
+                "title": page["title"],
+                "snippet": content.content[:300],
+                "score": score,
+            })
+
+    for source in wiki.list_raw_sources():
+        raw = wiki.get_raw_source(source["paper_id"])
+        score = sum(1 for t in query_tokens if t in raw.lower())
+        if score > 0:
+            results.append({
+                "type": "raw_source",
+                "paper_id": source["paper_id"],
+                "title": source.get("title", source["paper_id"]),
+                "snippet": _find_relevant_snippet(raw, query_tokens),
+                "score": score,
+            })
+
+    results.sort(key=lambda x: -x["score"])
+    return results[:limit]
+
+
+def _find_relevant_snippet(text: str, tokens: set, window: int = 300) -> str:
+    clean = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    lines = clean.split("\n")
+    best_line = 0
+    best_score = 0
+    for i, line in enumerate(lines):
+        score = sum(1 for t in tokens if t in line.lower())
+        if score > best_score:
+            best_score = score
+            best_line = i
+
+    start = max(0, best_line - 2)
+    end = min(len(lines), best_line + 3)
+    snippet = "\n".join(lines[start:end])
+    return snippet[:window]
+
+
 # --- Knowledge endpoints ---
 
 @router.post("/knowledge/query")
 async def query_knowledge(request: QueryRequest):
     try:
-        llm = get_llm_service()
-        vs = get_vector_store()
-        coordinator = AgentCoordinator(llm, vs)
+        coordinator = get_agent_coordinator()
 
-        context = AgentContext(query=request.query, paper_id=request.paper_id)
+        context = AgentContext(query=request.query, paper_id=request.paper_id,
+                               extra={"wiki_kb_id": request.wiki_kb_id} if request.wiki_kb_id else {})
 
         # Build topic-aware where filter
         where_filter = {}
@@ -707,6 +1344,8 @@ async def query_knowledge(request: QueryRequest):
             where_filter["topic"] = request.topic
         elif request.topics:
             where_filter["topics"] = request.topics
+        if request.wiki_kb_id:
+            where_filter["wiki_kb_id"] = request.wiki_kb_id
 
         response = await coordinator.route_and_process(context, where_filter=where_filter or None)
     except (_anthropic.AuthenticationError, _anthropic.PermissionDeniedError) as e:
@@ -761,17 +1400,18 @@ async def chat(request: ChatRequest):
         topic_where["topic"] = request.topic
     elif request.topics:
         topic_where["topics"] = request.topics
+    if request.wiki_kb_id:
+        topic_where["wiki_kb_id"] = request.wiki_kb_id
 
     # Process through agent coordinator
     try:
-        llm = get_llm_service()
-        vs = get_vector_store()
-        coordinator = AgentCoordinator(llm, vs)
+        coordinator = get_agent_coordinator()
 
         context = AgentContext(
             query=request.message,
             chat_history=chat_history,
             paper_id=request.paper_id,
+            extra={"wiki_kb_id": request.wiki_kb_id} if request.wiki_kb_id else {},
         )
         response = await coordinator.route_and_process(context, where_filter=topic_where or None)
     except (_anthropic.AuthenticationError, _anthropic.PermissionDeniedError) as e:
@@ -815,15 +1455,16 @@ async def chat(request: ChatRequest):
 @router.get("/knowledge/timeline")
 async def get_timeline():
     vs = get_vector_store()
-    chunks = vs.query(
+    chunks = await asyncio.to_thread(
+        vs.query,
         "domain timeline breakthroughs key developments methods history",
-        n_results=30,
+        30,
     )
     if not chunks:
         return {"timeline": [], "summary": "No papers in the knowledge base yet."}
     try:
         llm = get_llm_service()
-        answer = llm.generate_with_context(
+        answer = await llm.generate_with_context_async(
             query="Generate a chronological timeline of key breakthroughs and developments in single-cell 3D genomics. "
                   "Include years, key methods, and their significance.",
             context_chunks=chunks,
@@ -851,10 +1492,11 @@ async def compare_methods(request: CompareRequest):
     query = f"Compare these methods: {', '.join(request.methods)}"
     if request.aspects:
         query += f". Focus on: {', '.join(request.aspects)}"
-    chunks = vs.query(query, n_results=20)
+    where_filter = {"wiki_kb_id": request.wiki_kb_id} if request.wiki_kb_id else None
+    chunks = await asyncio.to_thread(vs.query, query, 20, where_filter)
     try:
         llm = get_llm_service()
-        answer = llm.generate_with_context(
+        answer = await llm.generate_with_context_async(
             query=query,
             context_chunks=chunks,
             system="""You are a methods expert in single-cell 3D genomics.
@@ -879,10 +1521,7 @@ Cite sources using [Source N] notation.""",
 @router.post("/writing/draft-review")
 async def draft_review(request: DraftReviewRequest):
     try:
-        llm = get_llm_service()
-        vs = get_vector_store()
-        from agents.writing_assistant import WritingAssistantAgent
-        agent = WritingAssistantAgent(llm, vs)
+        agent = get_writing_assistant_agent()
         context = AgentContext(
             query=f"Draft a {request.section_type} section about: {request.topic}",
             user_perspective=request.user_perspective,
@@ -893,6 +1532,8 @@ async def draft_review(request: DraftReviewRequest):
             where_filter["topic"] = request.expert_topic
         elif request.expert_topics:
             where_filter["topics"] = request.expert_topics
+        if request.wiki_kb_id:
+            where_filter["wiki_kb_id"] = request.wiki_kb_id
         response = await agent.process(context, where_filter=where_filter or None)
     except (_anthropic.AuthenticationError, _anthropic.PermissionDeniedError):
         raise HTTPException(status_code=401, detail="LLM authentication failed. Check ANTHROPIC_API_KEY in .env")
@@ -912,11 +1553,9 @@ async def draft_review(request: DraftReviewRequest):
 @router.post("/writing/suggest-citations")
 async def suggest_citations(request: CitationRequest):
     try:
-        llm = get_llm_service()
-        vs = get_vector_store()
-        from agents.writing_assistant import WritingAssistantAgent
-        agent = WritingAssistantAgent(llm, vs)
-        response = await agent.suggest_citations(request.text, request.n_results)
+        agent = get_writing_assistant_agent()
+        where_filter = {"wiki_kb_id": request.wiki_kb_id} if request.wiki_kb_id else None
+        response = await agent.suggest_citations(request.text, request.n_results, where_filter=where_filter)
     except (_anthropic.AuthenticationError, _anthropic.PermissionDeniedError):
         raise HTTPException(status_code=401, detail="LLM authentication failed. Check ANTHROPIC_API_KEY in .env")
     except _anthropic.APIStatusError as e:
@@ -935,16 +1574,14 @@ async def suggest_citations(request: CitationRequest):
 @router.post("/review/evaluate")
 async def evaluate_paper(request: EvaluateRequest):
     try:
-        llm = get_llm_service()
-        vs = get_vector_store()
-        from agents.reviewer import ReviewerAgent
-        agent = ReviewerAgent(llm, vs)
+        agent = get_reviewer_agent()
         focus = f" Focus on: {', '.join(request.focus_areas)}" if request.focus_areas else ""
+        where_filter = {"wiki_kb_id": request.wiki_kb_id} if request.wiki_kb_id else None
         context = AgentContext(
             query=f"Evaluate this paper comprehensively.{focus}",
             paper_id=request.paper_id,
         )
-        response = await agent.process(context)
+        response = await agent.process(context, where_filter=where_filter)
     except (_anthropic.AuthenticationError, _anthropic.PermissionDeniedError):
         raise HTTPException(status_code=401, detail="LLM authentication failed. Check ANTHROPIC_API_KEY in .env")
     except _anthropic.APIStatusError as e:
@@ -1011,10 +1648,8 @@ async def get_hypergraph_timeline(request: HypergraphTimelineRequest):
     try:
         llm = get_llm_service()
 
-        # Build hypergraph data structure
-        hypergraph = _build_hypergraph_from_papers(job.papers)
+        hypergraph = await asyncio.to_thread(_build_hypergraph_from_papers, job.papers)
 
-        # Generate analysis using LLM
         analysis_prompt = _build_hypergraph_analysis_prompt(
             hypergraph,
             request.analysis_depth,
@@ -1023,7 +1658,7 @@ async def get_hypergraph_timeline(request: HypergraphTimelineRequest):
             request.include_milestones,
         )
 
-        analysis_result = llm.chat(
+        analysis_result = await llm.chat_async(
             messages=[{"role": "user", "content": analysis_prompt}],
             system="""You are a research network analyst specializing in hypergraph analysis.
 Analyze the provided hypergraph data and extract insights about:
@@ -1051,6 +1686,8 @@ Respond in JSON format with the following structure:
             analysis_json = json.loads(analysis_result)
         except json.JSONDecodeError:
             analysis_json = {"raw_analysis": analysis_result}
+
+        analysis_json = _attach_key_figure_author_ids(analysis_json, hypergraph)
 
         return {
             "job_id": request.job_id,
@@ -1264,6 +1901,70 @@ def _build_hypergraph_from_papers(papers: list[dict]) -> dict:
     }
 
 
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"[\s\.,;:()\[\]{}'\"`’]+", " ", (value or "").strip().lower()).strip()
+
+
+def _attach_key_figure_author_ids(analysis_json: dict, hypergraph: dict) -> dict:
+    key_figures = analysis_json.get("key_figures")
+    if not isinstance(key_figures, list):
+        return analysis_json
+
+    authors = hypergraph.get("nodes", {}).get("authors", [])
+    author_by_id = {author.get("id"): author for author in authors if author.get("id")}
+    authors_by_name: dict[str, list[dict]] = {}
+
+    for author in authors:
+        normalized_name = _normalize_match_text(author.get("name"))
+        if not normalized_name:
+            continue
+        authors_by_name.setdefault(normalized_name, []).append(author)
+
+    for figure in key_figures:
+        if not isinstance(figure, dict):
+            continue
+        author_id = figure.get("author_id")
+        if author_id and author_id in author_by_id:
+            figure.setdefault("match_confidence", 1.0)
+            continue
+
+        normalized_name = _normalize_match_text(figure.get("name"))
+        normalized_institution = _normalize_match_text(figure.get("institution"))
+        candidates = authors_by_name.get(normalized_name, [])
+        if not candidates:
+            continue
+
+        scored: list[tuple[float, dict]] = []
+        for candidate in candidates:
+            score = 0.0
+            if _normalize_match_text(candidate.get("name")) == normalized_name:
+                score += 3.0
+            candidate_affiliation = _normalize_match_text(candidate.get("affiliation"))
+            if normalized_institution and normalized_institution in candidate_affiliation:
+                score += 2.0
+            score += min((candidate.get("total_citations", 0) or 0) / 100, 1.5)
+            score += min(len(candidate.get("papers", []) or []) / 10, 1.0)
+            score += min((candidate.get("is_first_author_count", 0) or 0) / 5, 0.75)
+            score += min((candidate.get("is_corresponding_author_count", 0) or 0) / 5, 0.75)
+            scored.append((score, candidate))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if not scored:
+            continue
+
+        best_score, best_candidate = scored[0]
+        runner_up_score = scored[1][0] if len(scored) > 1 else None
+        if best_score < 3.0:
+            continue
+        if runner_up_score is not None and best_score - runner_up_score < 0.5:
+            continue
+
+        figure["author_id"] = best_candidate.get("id")
+        figure["match_confidence"] = round(min(best_score / 6.0, 1.0), 3)
+
+    return analysis_json
+
+
 def _build_hypergraph_analysis_prompt(
     hypergraph: dict,
     depth: str,
@@ -1359,3 +2060,61 @@ Return your analysis in the specified JSON format.
 """
 
     return prompt
+
+
+# ── LLM Wiki Compiler ────────────────────────────────────────────────────────
+
+
+async def _llm_compile_wiki(llm, schema_rules: str, existing_pages: list[dict], new_markdown: str, paper_id: str) -> dict:
+    """Use LLM to compile raw markdown into structured wiki pages (Karpathy-style).
+
+    The LLM acts as a "librarian" that:
+    1. Extracts entities, concepts, methods, and findings from the new source
+    2. Creates new wiki pages for novel content
+    3. Updates existing pages when the new source adds or contradicts info
+    4. Adds cross-references between pages
+    """
+    import json as _json
+
+    existing_summary = "\n".join(
+        f"- [{p['slug']}] {p['title']} (type: {p['page_type']})" for p in existing_pages
+    ) or "(no existing pages)"
+
+    system_prompt = f"""You are a Wiki Librarian — a LLM that maintains a structured knowledge base.
+
+{schema_rules}
+
+## Existing Wiki Pages
+{existing_summary}
+
+## Your Task
+Given a NEW raw document (markdown), create and update wiki pages following the schema rules.
+
+Output a JSON object with this structure:
+{{"pages": [{{"title": "Page Title", "content": "Markdown content with [[cross-refs]] and [src: paper_id]", "page_type": "entity|concept|comparison|synthesis|index", "cross_refs": ["other-page-slug"]}}]}}
+
+Rules:
+- Create at least 3-5 pages: one synthesis page and several entity/concept pages
+- Each page MUST cite sources using [src: {paper_id}] notation
+- Use [[page-slug]] for cross-references
+- Mark contradictions with > ⚠️ CONTRADICTION: blocks
+- Keep pages focused — no page should exceed 3000 characters
+- Output ONLY valid JSON, no markdown wrapping"""
+
+    user_prompt = f"""New Source Document (paper_id: {paper_id}):
+
+{new_markdown[:8000]}
+
+Create wiki pages from this document. Output JSON only."""
+
+    try:
+        raw_response = await llm.generate_raw(system_prompt, user_prompt)
+        # Try to extract JSON from response
+        json_start = raw_response.find("{")
+        json_end = raw_response.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            return _json.loads(raw_response[json_start:json_end])
+        return {"pages": []}
+    except Exception as e:
+        logger.warning(f"Wiki compile LLM error: {e}")
+        return {"pages": []}

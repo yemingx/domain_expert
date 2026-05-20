@@ -1,11 +1,13 @@
 import { useState, useRef } from 'react';
-import { Button, Card, List, Tag, Typography, Space, message, Progress, Table } from 'antd';
+import { Button, Card, List, Tag, Typography, Space, message, Progress, Table, Switch } from 'antd';
 import {
   UploadOutlined, FileTextOutlined, ReloadOutlined,
   FolderOpenOutlined, CheckCircleOutlined, CloseCircleOutlined, LoadingOutlined,
+  RobotOutlined,
 } from '@ant-design/icons';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { uploadPaper, listPapers } from '../utils/api';
+import { uploadPaper, uploadPaperWithMineru, uploadPaperWithMineruToKB, listPapers } from '../utils/api';
+import { useSelectedWikiKbId } from '../stores/appStore';
 import type { Paper } from '../types';
 
 const { Text } = Typography;
@@ -26,8 +28,10 @@ interface QueueItem {
 
 export default function PaperUpload() {
   const queryClient = useQueryClient();
+  const selectedWikiKbId = useSelectedWikiKbId();
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [running, setRunning] = useState(false);
+  const [useMineru, setUseMineru] = useState(true);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -35,12 +39,14 @@ export default function PaperUpload() {
   const [dragOver, setDragOver] = useState(false);
 
   const { data: papers = [], isLoading, refetch } = useQuery({
-    queryKey: ['papers'],
-    queryFn: listPapers,
-    refetchInterval: 5000,
+    queryKey: ['papers', selectedWikiKbId],
+    queryFn: () => listPapers(selectedWikiKbId),
+    refetchInterval: (query) => {
+      const data = query.state.data as Paper[] | undefined;
+      const hasActivePapers = data?.some((paper) => paper.status === 'pending' || paper.status === 'processing');
+      return running || hasActivePapers ? 5000 : false;
+    },
   });
-
-  // ── helpers ────────────────────────────────────────────────────────────────
 
   const updateItem = (idx: number, patch: Partial<QueueItem>) =>
     setQueue(q => q.map((item, i) => (i === idx ? { ...item, ...patch } : item)));
@@ -54,8 +60,6 @@ export default function PaperUpload() {
     message.success(`Added ${pdfs.length} PDF${pdfs.length > 1 ? 's' : ''} to queue`);
   };
 
-  // ── sequential upload runner ───────────────────────────────────────────────
-
   const runQueue = async (currentQueue: QueueItem[]) => {
     if (running) return;
     setRunning(true);
@@ -65,7 +69,13 @@ export default function PaperUpload() {
 
       updateItem(i, { status: 'uploading' });
       try {
-        await uploadPaper(currentQueue[i].file);
+        if (useMineru && selectedWikiKbId) {
+          await uploadPaperWithMineruToKB(currentQueue[i].file, selectedWikiKbId);
+        } else if (useMineru) {
+          await uploadPaperWithMineru(currentQueue[i].file);
+        } else {
+          await uploadPaper(currentQueue[i].file);
+        }
         updateItem(i, { status: 'done' });
         queryClient.invalidateQueries({ queryKey: ['papers'] });
       } catch (err: any) {
@@ -80,7 +90,6 @@ export default function PaperUpload() {
   };
 
   const handleStartUpload = () => {
-    // snapshot current queue to iterate correctly
     setQueue(q => {
       runQueue(q);
       return q;
@@ -90,15 +99,11 @@ export default function PaperUpload() {
   const clearCompleted = () =>
     setQueue(q => q.filter(item => item.status === 'pending' || item.status === 'uploading'));
 
-  // ── drag-and-drop ──────────────────────────────────────────────────────────
-
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
     enqueue(e.dataTransfer.files);
   };
-
-  // ── derived state ──────────────────────────────────────────────────────────
 
   const pendingCount = queue.filter(i => i.status === 'pending').length;
   const doneCount = queue.filter(i => i.status === 'done').length;
@@ -107,8 +112,6 @@ export default function PaperUpload() {
   const overallProgress = queue.length
     ? Math.round(((doneCount + errorCount) / queue.length) * 100)
     : 0;
-
-  // ── queue status icon ──────────────────────────────────────────────────────
 
   const statusIcon = (item: QueueItem) => {
     if (item.status === 'uploading') return <LoadingOutlined style={{ color: '#1677ff' }} />;
@@ -119,9 +122,7 @@ export default function PaperUpload() {
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="large">
-      {/* ── Upload zone ──────────────────────────────────────────────────── */}
       <Card title="Upload Research Papers">
-        {/* drop zone */}
         <div
           ref={dropRef}
           onDrop={onDrop}
@@ -148,7 +149,6 @@ export default function PaperUpload() {
           </p>
         </div>
 
-        {/* hidden inputs */}
         <input
           ref={fileInputRef}
           type="file"
@@ -160,21 +160,36 @@ export default function PaperUpload() {
         <input
           ref={folderInputRef}
           type="file"
-          // @ts-ignore – non-standard but supported in all major browsers
+          // @ts-ignore
           webkitdirectory=""
           multiple
           style={{ display: 'none' }}
           onChange={e => { if (e.target.files) enqueue(e.target.files); e.target.value = ''; }}
         />
 
-        {/* action buttons */}
-        <Space wrap>
+        <Space wrap style={{ marginBottom: 12 }}>
           <Button icon={<UploadOutlined />} onClick={() => fileInputRef.current?.click()}>
             Select PDFs
           </Button>
           <Button icon={<FolderOpenOutlined />} onClick={() => folderInputRef.current?.click()}>
             Select Folder
           </Button>
+          <Space style={{
+            border: '1px solid #d9d9d9',
+            borderRadius: 6,
+            padding: '4px 12px',
+            background: '#fafafa',
+          }}>
+            <RobotOutlined style={{ color: useMineru ? '#722ed1' : '#999' }} />
+            <Text>MinerU MD</Text>
+            <Switch
+              size="small"
+              checked={useMineru}
+              onChange={setUseMineru}
+              checkedChildren={<FileTextOutlined />}
+              unCheckedChildren={<FileTextOutlined />}
+            />
+          </Space>
           {queue.length > 0 && (
             <>
               <Button
@@ -192,7 +207,18 @@ export default function PaperUpload() {
           )}
         </Space>
 
-        {/* overall progress */}
+        {useMineru && (
+          <Card size="small" style={{ background: '#f9f0ff', border: '1px solid #d3adf7', marginBottom: 8, borderRadius: 6 }}>
+            <Space>
+              <RobotOutlined style={{ color: '#722ed1' }} />
+              <Text style={{ color: '#531dab' }}>
+                MinerU mode: PDF will be converted to Markdown via AI-powered OCR.
+                Results will be indexed into the LLM Wiki for source-traceable Q&A.
+              </Text>
+            </Space>
+          </Card>
+        )}
+
         {queue.length > 0 && (
           <div style={{ marginTop: 16 }}>
             <Space style={{ marginBottom: 4 }}>
@@ -206,7 +232,6 @@ export default function PaperUpload() {
           </div>
         )}
 
-        {/* per-file queue table */}
         {queue.length > 0 && (
           <Table
             size="small"
@@ -245,7 +270,6 @@ export default function PaperUpload() {
         )}
       </Card>
 
-      {/* ── Papers in knowledge base ─────────────────────────────────────── */}
       <Card
         title="Papers in Knowledge Base"
         extra={<Button icon={<ReloadOutlined />} onClick={() => refetch()}>Refresh</Button>}
@@ -262,6 +286,12 @@ export default function PaperUpload() {
                   <Space>
                     <Text strong>{paper.title || paper.filename}</Text>
                     <Tag color={statusColors[paper.status]}>{paper.status}</Tag>
+                    {paper.markdown_status === 'completed' && (
+                       <Tag color="purple" icon={<RobotOutlined />}>MD</Tag>
+                     )}
+                    {paper.wiki_pages_count && paper.wiki_pages_count > 0 && (
+                      <Tag color="gold">Wiki: {paper.wiki_pages_count} pages</Tag>
+                    )}
                   </Space>
                 }
                 description={

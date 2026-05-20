@@ -33,20 +33,27 @@ class TextChunk:
 class PDFProcessor:
     ATOMIC_CHUNK_SIZE = 800
     ATOMIC_OVERLAP = 100
+    SECTION_PATTERN = re.compile(
+        r'^(?:\d+\.?\s+)?(?:abstract|introduction|methods?|results?|discussion|conclusion|'
+        r'references|acknowledgment|supplementary|materials?\s+and\s+methods?|'
+        r'background|related\s+work|experimental|figures?|tables?)',
+        re.IGNORECASE,
+    )
 
-    def process_pdf(self, pdf_path: str) -> tuple[PaperMetadata, list[TextChunk], str]:
+    def process_pdf(self, pdf_path: str, include_full_text: bool = False) -> tuple[PaperMetadata, list[TextChunk], str]:
         path = Path(pdf_path)
         if not path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         doc = fitz.open(str(path))
-        metadata = self._extract_metadata(doc, path.name)
-        sections = self._extract_sections(doc)
-        full_text = "\n".join(s["text"] for s in sections)
-        chunks = self._create_hierarchical_chunks(sections)
-
-        doc.close()
-        return metadata, chunks, full_text
+        try:
+            metadata = self._extract_metadata(doc, path.name)
+            sections = self._extract_sections(doc)
+            full_text = "\n".join(s["text"] for s in sections) if include_full_text else ""
+            chunks = self._create_hierarchical_chunks(sections)
+            return metadata, chunks, full_text
+        finally:
+            doc.close()
 
     def _extract_metadata(self, doc: fitz.Document, filename: str) -> PaperMetadata:
         meta = PaperMetadata(filename=filename, num_pages=len(doc))
@@ -102,13 +109,6 @@ class PDFProcessor:
         sections = []
         current_section = {"title": "Introduction", "text": "", "page_start": 0, "page_end": 0}
 
-        section_pattern = re.compile(
-            r'^(?:\d+\.?\s+)?(?:abstract|introduction|methods?|results?|discussion|conclusion|'
-            r'references|acknowledgment|supplementary|materials?\s+and\s+methods?|'
-            r'background|related\s+work|experimental|figures?|tables?)',
-            re.IGNORECASE,
-        )
-
         for page_num in range(len(doc)):
             page = doc[page_num]
             blocks = page.get_text("dict")["blocks"]
@@ -138,7 +138,7 @@ class PDFProcessor:
                 if not block_text:
                     continue
 
-                if is_heading and section_pattern.match(block_text):
+                if is_heading and self.SECTION_PATTERN.match(block_text):
                     if current_section["text"].strip():
                         sections.append(current_section)
                     current_section = {

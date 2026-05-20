@@ -18,7 +18,10 @@ logger = logging.getLogger(__name__)
 
 # Research results storage
 RESEARCH_DIR = Path("./data/research")
-RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_research_dir() -> None:
+    RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -76,6 +79,7 @@ class LiteratureResearchService:
     """Service for running literature research locally."""
 
     def __init__(self):
+        _ensure_research_dir()
         self.jobs: dict[str, ResearchJob] = {}
         self._load_existing_jobs()
 
@@ -85,6 +89,7 @@ class LiteratureResearchService:
         Completed jobs whose result folder has been deleted externally are
         treated as stale: their JSON metadata is removed and they are not loaded.
         """
+        _ensure_research_dir()
         stale_files: list[Path] = []
         for job_file in RESEARCH_DIR.glob("*.json"):
             try:
@@ -110,6 +115,7 @@ class LiteratureResearchService:
 
     def _save_job(self, job: ResearchJob):
         """Save job to disk."""
+        _ensure_research_dir()
         job_file = RESEARCH_DIR / f"{job.job_id}.json"
         with open(job_file, 'w', encoding='utf-8') as f:
             json.dump(job.__dict__, f, ensure_ascii=False, indent=2)
@@ -156,6 +162,9 @@ class LiteratureResearchService:
             # Support ANTHROPIC_AUTH_TOKEN as fallback for ANTHROPIC_API_KEY
             if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
                 os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+            # Propagate custom base URL to submodules — always override stale system env
+            if settings.anthropic_base_url:
+                os.environ["ANTHROPIC_BASE_URL"] = settings.anthropic_base_url
 
             # Log API key status (without revealing the key)
             if settings.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY"):
@@ -250,50 +259,10 @@ class LiteratureResearchService:
             else:
                 logger.info(f"[Stage 1/4] PubMed search skipped (already completed)")
 
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 2: Semantic Scholar Enrichment (with checkpoint resume)
-            # ═══════════════════════════════════════════════════════════════════
-            if not job.stage_completed.get("enriching"):
-                job.current_stage = "enriching"
-                self._save_job(job)
-
-                logger.info(f"[Stage 2/4] Semantic Scholar enrichment for job {job_id}")
-
-                def _run_s2_enrichment():
-                    try:
-                        for _mod in ("enrich_semantic_scholar",):
-                            sys.modules.pop(_mod, None)
-                        from enrich_semantic_scholar import enrich_papers_with_semantic_scholar
-
-                        network_limit = getattr(settings, "semantic_scholar_network_limit", 100)
-                        enrich_papers_with_semantic_scholar(
-                            job.papers,
-                            api_key=getattr(settings, "semantic_scholar_api_key", ""),
-                            fetch_network=True,
-                            network_limit=network_limit,
-                        )
-                        # Review: check S2 match failures
-                        missing = [p.get("title", "")[:60] for p in job.papers
-                                   if not p.get("s2_paper_id")]
-                        if missing:
-                            msg = f"Semantic Scholar 未匹配 {len(missing)}/{len(job.papers)} 篇（引用数据缺失）"
-                            logger.warning(f"[S2] {msg}: {missing[:3]}")
-                            job.warnings.append(msg)
-                        logger.info(f"S2 enrichment completed for job {job_id}")
-                    except Exception as s2_err:
-                        msg = f"Semantic Scholar 富化失败（引用数据不可用）: {s2_err}"
-                        logger.warning(f"S2 enrichment failed (non-fatal): {s2_err}")
-                        job.warnings.append(msg)
-
-                await asyncio.to_thread(_run_s2_enrichment)
-
-                # Save after enrichment
-                job.stage_completed["enriching"] = True
-                job.last_successful_stage = "enriching"
-                self._save_job(job)
-                logger.info(f"[Stage 2/4] Semantic Scholar enrichment completed")
-            else:
-                logger.info(f"[Stage 2/4] Semantic Scholar enrichment skipped (already completed)")
+            # STAGE 2: Semantic Scholar Enrichment — disabled
+            job.stage_completed["enriching"] = True
+            job.last_successful_stage = "enriching"
+            self._save_job(job)
 
             # ═══════════════════════════════════════════════════════════════════
             # STAGE 3: LLM Analysis (with per-paper checkpoint resume)
@@ -416,9 +385,12 @@ class LiteratureResearchService:
                             self._save_job(job)
 
                         # Final review: generate warnings
+                        # Only count as failed if abstract exists but analysis failed (not missing abstract)
                         failed_analysis = [p.get("title", "")[:50] for p in job.papers
-                                           if any((p.get(k) or "") in (_FAILED_SENTINEL, "摘要缺失，无法分析")
-                                                  for k in _analysis_keys)]
+                                           if p.get("abstract") and
+                                           any((p.get(k) or "") in (_FAILED_SENTINEL,)
+                                               for k in _analysis_keys)]
+                        no_abstract = sum(1 for p in job.papers if not p.get("abstract"))
                         failed_trans = [p.get("title", "")[:50] for p in job.papers
                                         if not (p.get("abstract_cn") or "").strip() and p.get("abstract")]
 
@@ -427,6 +399,8 @@ class LiteratureResearchService:
                                    f"（可能原因：LLM API 过载或网络抖动）")
                             logger.warning(f"[Review] {msg}")
                             job.warnings.append(msg)
+                        if no_abstract:
+                            logger.info(f"[Review] {no_abstract} 篇摘要缺失（PubMed 数据源无摘要），已跳过分析")
                         if failed_trans:
                             msg = (f"中文翻译失败 {len(failed_trans)}/{len(job.papers)} 篇"
                                    f"（可能原因：LLM API 不可用）")
